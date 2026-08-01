@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def utc_now() -> str:
@@ -124,6 +124,36 @@ class Database:
                     reused_files INTEGER NOT NULL DEFAULT 0,
                     message TEXT
                 );
+                CREATE TABLE IF NOT EXISTS asset_relationships (
+                    id INTEGER PRIMARY KEY,
+                    relationship_type TEXT NOT NULL CHECK (relationship_type IN (
+                        'apple_live_photo','google_motion_photo','samsung_motion_photo',
+                        'filename_pair','orphan_motion_image','orphan_motion_video')),
+                    primary_asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    secondary_asset_id INTEGER REFERENCES assets(id),
+                    confidence REAL NOT NULL CHECK (confidence >= 0 AND confidence <= 1),
+                    evidence TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('active','orphan','ambiguous','invalid')
+                    ),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    CHECK (secondary_asset_id IS NULL OR primary_asset_id != secondary_asset_id)
+                );
+                CREATE TABLE IF NOT EXISTS relationship_runs (
+                    id INTEGER PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status TEXT NOT NULL CHECK (status IN
+                        ('running','completed','completed_with_errors','failed')),
+                    candidate_assets INTEGER NOT NULL DEFAULT 0,
+                    relationships_created INTEGER NOT NULL DEFAULT 0,
+                    relationships_reused INTEGER NOT NULL DEFAULT 0,
+                    ambiguous_count INTEGER NOT NULL DEFAULT 0,
+                    orphan_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    message TEXT
+                );
                 """
             )
             columns = {
@@ -166,6 +196,13 @@ class Database:
                 "frame_rate": "REAL",
                 "bitrate": "INTEGER",
                 "color_space": "TEXT",
+                "apple_content_identifier": "TEXT",
+                "motion_photo_offset": "INTEGER",
+                "relationship_status": "TEXT CHECK (relationship_status IN "
+                "('pending','completed','failed','invalid'))",
+                "relationship_error": "TEXT",
+                "relationship_analyzed_size_bytes": "INTEGER",
+                "relationship_analyzed_mtime_ns": "INTEGER",
             }
             for name, definition in additions.items():
                 if name not in columns:
@@ -185,6 +222,17 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_assets_captured_at ON assets(captured_at);
                 CREATE INDEX IF NOT EXISTS idx_assets_camera_make ON assets(camera_make);
                 CREATE INDEX IF NOT EXISTS idx_assets_camera_model ON assets(camera_model);
+                CREATE INDEX IF NOT EXISTS idx_relationship_type
+                    ON asset_relationships(relationship_type);
+                CREATE INDEX IF NOT EXISTS idx_relationship_primary
+                    ON asset_relationships(primary_asset_id);
+                CREATE INDEX IF NOT EXISTS idx_relationship_secondary
+                    ON asset_relationships(secondary_asset_id);
+                CREATE INDEX IF NOT EXISTS idx_relationship_status
+                    ON asset_relationships(status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_relationship_active_unique
+                    ON asset_relationships(relationship_type,primary_asset_id,
+                        COALESCE(secondary_asset_id,-1)) WHERE status='active';
                 """
             )
 
@@ -308,6 +356,22 @@ class Database:
         latest_analysis = connection.execute(
             "SELECT * FROM analysis_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        latest_relationship = connection.execute(
+            "SELECT * FROM relationship_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        relationship_counts = connection.execute(
+            """SELECT
+            SUM(status='active') active,
+            SUM(relationship_type='apple_live_photo' AND status='active') apple,
+            SUM(relationship_type='google_motion_photo' AND status='active') google,
+            SUM(relationship_type='samsung_motion_photo' AND status='active') samsung,
+            SUM(relationship_type='filename_pair' AND status='active') filename,
+            SUM(relationship_type='orphan_motion_image' AND status='orphan') orphan_image,
+            SUM(relationship_type='orphan_motion_video' AND status='orphan') orphan_video,
+            SUM(status='ambiguous') ambiguous,
+            SUM(status='invalid') invalid FROM asset_relationships"""
+        ).fetchone()
+        assert relationship_counts is not None
         return {
             "total": scalar["total"],
             "available": scalar["available"] or 0,
@@ -333,4 +397,14 @@ class Database:
             "images": scalar["images"] or 0,
             "videos": scalar["videos"] or 0,
             "latest_analysis_run": latest_analysis,
+            "relationships_active": relationship_counts["active"] or 0,
+            "apple_live_photos": relationship_counts["apple"] or 0,
+            "google_motion_photos": relationship_counts["google"] or 0,
+            "samsung_motion_photos": relationship_counts["samsung"] or 0,
+            "filename_pairs": relationship_counts["filename"] or 0,
+            "orphan_motion_images": relationship_counts["orphan_image"] or 0,
+            "orphan_motion_videos": relationship_counts["orphan_video"] or 0,
+            "ambiguous_relationships": relationship_counts["ambiguous"] or 0,
+            "invalid_relationships": relationship_counts["invalid"] or 0,
+            "latest_relationship_run": latest_relationship,
         }
