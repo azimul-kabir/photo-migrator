@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -71,7 +71,15 @@ class Database:
                     last_seen_at TEXT NOT NULL,
                     missing_since TEXT,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    sha256 TEXT,
+                    hash_algorithm TEXT,
+                    hash_status TEXT NOT NULL DEFAULT 'pending' CHECK (
+                        hash_status IN ('pending', 'running', 'completed', 'failed')
+                    ),
+                    hash_started_at TEXT,
+                    hash_completed_at TEXT,
+                    hash_error TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_assets_size ON assets(size_bytes);
                 CREATE INDEX IF NOT EXISTS idx_assets_extension ON assets(extension);
@@ -90,8 +98,37 @@ class Database:
                     error_count INTEGER NOT NULL DEFAULT 0,
                     message TEXT
                 );
+                CREATE TABLE IF NOT EXISTS hash_runs (
+                    id INTEGER PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('running', 'completed', 'completed_with_errors', 'failed')
+                    ),
+                    candidate_files INTEGER NOT NULL DEFAULT 0,
+                    hashed_files INTEGER NOT NULL DEFAULT 0,
+                    failed_files INTEGER NOT NULL DEFAULT 0,
+                    message TEXT
+                );
                 """
             )
+            columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(assets)").fetchall()
+            }
+            additions = {
+                "sha256": "TEXT",
+                "hash_algorithm": "TEXT",
+                "hash_status": (
+                    "TEXT NOT NULL DEFAULT 'pending' CHECK "
+                    "(hash_status IN ('pending','running','completed','failed'))"
+                ),
+                "hash_started_at": "TEXT",
+                "hash_completed_at": "TEXT",
+                "hash_error": "TEXT",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    connection.execute(f"ALTER TABLE assets ADD COLUMN {name} {definition}")
             connection.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
                 (SCHEMA_VERSION, utc_now()),
@@ -155,7 +192,20 @@ class Database:
                     mtime_ns=excluded.mtime_ns, device_id=excluded.device_id, inode=excluded.inode,
                     media_type=excluded.media_type, scan_status='available', error_message=NULL,
                     last_seen_at=excluded.last_seen_at, missing_since=NULL,
-                    updated_at=excluded.updated_at
+                    updated_at=excluded.updated_at,
+                    hash_status=CASE WHEN assets.size_bytes != excluded.size_bytes
+                        OR assets.mtime_ns != excluded.mtime_ns THEN 'pending'
+                        ELSE assets.hash_status END,
+                    sha256=CASE WHEN assets.size_bytes != excluded.size_bytes
+                        OR assets.mtime_ns != excluded.mtime_ns THEN NULL ELSE assets.sha256 END,
+                    hash_algorithm=CASE WHEN assets.size_bytes != excluded.size_bytes
+                        OR assets.mtime_ns != excluded.mtime_ns THEN NULL
+                        ELSE assets.hash_algorithm END,
+                    hash_completed_at=CASE WHEN assets.size_bytes != excluded.size_bytes
+                        OR assets.mtime_ns != excluded.mtime_ns THEN NULL
+                        ELSE assets.hash_completed_at END,
+                    hash_error=CASE WHEN assets.size_bytes != excluded.size_bytes
+                        OR assets.mtime_ns != excluded.mtime_ns THEN NULL ELSE assets.hash_error END
                 """,
                 values,
             )
