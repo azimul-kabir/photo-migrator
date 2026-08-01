@@ -1,0 +1,21 @@
+[[sources]]
+name = "MobileBackup"
+path = "/volume1/photo/MobileBackup"
+priority = 100
+
+[[sources]]
+name = "Originals"
+path = "/volume1/photo/originals"
+priority = 80
+
+[scan]
+extensions = [
+  ".jpg", ".jpeg", ".heic", ".png", ".gif",
+  ".tif", ".tiff", ".dng", ".webp",
+  ".mov", ".mp4", ".m4v"
+]
+exclude_directory_names = [
+  "@eaDir", "#recycle", "Photos Library.photoslibrary", "CleanLibrary"
+]
+exclude_filename_suffixes = ["@SynoEAStream"]
+exclude_filename_prefixes = ["SYNOINDEX_"]

@@ -5,7 +5,14 @@ description = "Safely inventory, deduplicate, plan, and build an Immich-ready ph
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "Azimul Kabir" }]
-dependencies = []
+dependencies = ["tomli>=1.1.0; python_version < '3.11'"]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.10",
+  "pytest>=8",
+  "ruff>=0.5",
+]
 
 [project.scripts]
 photo-migrator = "photo_migrator.cli:main"
@@ -32,3 +39,4 @@ mypy_path = "src"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["src"]
