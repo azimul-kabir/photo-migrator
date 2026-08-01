@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def utc_now() -> str:
@@ -110,6 +110,20 @@ class Database:
                     failed_files INTEGER NOT NULL DEFAULT 0,
                     message TEXT
                 );
+                CREATE TABLE IF NOT EXISTS analysis_runs (
+                    id INTEGER PRIMARY KEY,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('running','completed','completed_with_errors','failed')
+                    ),
+                    candidate_files INTEGER NOT NULL DEFAULT 0,
+                    analyzed_files INTEGER NOT NULL DEFAULT 0,
+                    failed_files INTEGER NOT NULL DEFAULT 0,
+                    unsupported_files INTEGER NOT NULL DEFAULT 0,
+                    reused_files INTEGER NOT NULL DEFAULT 0,
+                    message TEXT
+                );
                 """
             )
             columns = {
@@ -125,13 +139,53 @@ class Database:
                 "hash_started_at": "TEXT",
                 "hash_completed_at": "TEXT",
                 "hash_error": "TEXT",
+                "analysis_status": (
+                    "TEXT DEFAULT 'pending' CHECK (analysis_status IN "
+                    "('pending','running','completed','failed','unsupported'))"
+                ),
+                "analysis_started_at": "TEXT",
+                "analysis_completed_at": "TEXT",
+                "analysis_error": "TEXT",
+                "analyzed_size_bytes": "INTEGER",
+                "analyzed_mtime_ns": "INTEGER",
+                "captured_at": "TEXT",
+                "captured_at_source": "TEXT",
+                "width": "INTEGER",
+                "height": "INTEGER",
+                "orientation": "INTEGER",
+                "camera_make": "TEXT",
+                "camera_model": "TEXT",
+                "lens_model": "TEXT",
+                "gps_latitude": "REAL",
+                "gps_longitude": "REAL",
+                "gps_altitude": "REAL",
+                "duration_seconds": "REAL",
+                "video_codec": "TEXT",
+                "audio_codec": "TEXT",
+                "container_format": "TEXT",
+                "frame_rate": "REAL",
+                "bitrate": "INTEGER",
+                "color_space": "TEXT",
             }
             for name, definition in additions.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE assets ADD COLUMN {name} {definition}")
             connection.execute(
+                "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (2, ?)",
+                (utc_now(),),
+            )
+            connection.execute(
                 "INSERT OR IGNORE INTO schema_version(version, applied_at) VALUES (?, ?)",
                 (SCHEMA_VERSION, utc_now()),
+            )
+            connection.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_assets_analysis_status
+                    ON assets(analysis_status);
+                CREATE INDEX IF NOT EXISTS idx_assets_captured_at ON assets(captured_at);
+                CREATE INDEX IF NOT EXISTS idx_assets_camera_make ON assets(camera_make);
+                CREATE INDEX IF NOT EXISTS idx_assets_camera_model ON assets(camera_model);
+                """
             )
 
     def start_run(self, source_count: int) -> int:
@@ -236,11 +290,24 @@ class Database:
                SUM(CASE WHEN scan_status='missing' THEN 1 ELSE 0 END) AS missing,
                SUM(CASE WHEN scan_status='error' THEN 1 ELSE 0 END) AS errors,
                COALESCE(SUM(CASE WHEN scan_status='available' THEN size_bytes ELSE 0 END), 0)
-               AS bytes
+               AS bytes,
+               SUM(CASE WHEN analysis_status='completed' THEN 1 ELSE 0 END) analyses_completed,
+               SUM(CASE WHEN analysis_status='failed' THEN 1 ELSE 0 END) analyses_failed,
+               SUM(CASE WHEN analysis_status='unsupported' THEN 1 ELSE 0 END)
+                   analyses_unsupported,
+               SUM(CASE WHEN captured_at IS NOT NULL THEN 1 ELSE 0 END) with_captured_at,
+               SUM(CASE WHEN gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL
+                   THEN 1 ELSE 0 END)
+                   with_gps,
+               SUM(CASE WHEN media_type='image' THEN 1 ELSE 0 END) images,
+               SUM(CASE WHEN media_type='video' THEN 1 ELSE 0 END) videos
                FROM assets"""
         ).fetchone()
         assert scalar is not None
         latest = connection.execute("SELECT * FROM scan_runs ORDER BY id DESC LIMIT 1").fetchone()
+        latest_analysis = connection.execute(
+            "SELECT * FROM analysis_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
         return {
             "total": scalar["total"],
             "available": scalar["available"] or 0,
@@ -258,4 +325,12 @@ class Database:
                    GROUP BY extension ORDER BY extension"""
             ).fetchall(),
             "latest_run": latest,
+            "analyses_completed": scalar["analyses_completed"] or 0,
+            "analyses_failed": scalar["analyses_failed"] or 0,
+            "analyses_unsupported": scalar["analyses_unsupported"] or 0,
+            "with_captured_at": scalar["with_captured_at"] or 0,
+            "with_gps": scalar["with_gps"] or 0,
+            "images": scalar["images"] or 0,
+            "videos": scalar["videos"] or 0,
+            "latest_analysis_run": latest_analysis,
         }
