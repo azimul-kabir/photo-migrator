@@ -34,17 +34,34 @@ Copy `config.example.toml`, set each source path, and then run:
 uv run photo-migrator init --database inventory.db
 uv run photo-migrator scan --database inventory.db --config config.toml
 uv run photo-migrator stats --database inventory.db
+uv run photo-migrator hash --database inventory.db
 ```
 
 Scanning is resumable: assets are upserted by absolute path, prior scan runs remain in the
 database, and files absent after a successful source scan are retained as missing.
 
-## Milestone 1 safety
+## Hashing and exact-duplicate reports
+
+`hash` uses SQL size grouping to select only plausible duplicate candidates, then streams each
+candidate through SHA-256 in 1 MiB chunks. It never modifies a source. Hashing defaults to one
+worker; `--workers 4` enables parallel reads while keeping SQLite writes serialized. Use `--limit
+500` to bound a batch, `--source NAME` to restrict it, and `--resume` to retry failed work. Completed
+hashes are reused when the indexed size and modification time still match.
+
+Every invocation is retained in `hash_runs`. The command writes deterministic reports beside the
+database in `reports/hash_summary.txt` and `reports/duplicate_groups.csv`. The CSV has one row per
+duplicate file with its SHA-256, copy count, size, group byte total, and path.
+
+Limitations: detection is exact-content only. It does not inspect EXIF, identify Live Photos,
+choose keepers, delete duplicates, create a migration plan, or copy/link/import files. A failed
+file remains failed until explicitly retried with `--resume`.
+
+## Safety
 
 Milestone 1 performs **metadata-only filesystem scanning**. It reads directory entries and file
 stat metadata, but does not open or hash file contents. It does not copy, rename, move, hardlink,
 or delete media. Directory symlinks are not followed, and all discovered paths are checked for
 containment within their configured source root.
 
-Hashing, duplicate detection, EXIF extraction, library building, deletion, and Immich integration
-are intentionally outside this milestone.
+EXIF extraction, library building, deletion, and Immich integration are intentionally outside this
+milestone.

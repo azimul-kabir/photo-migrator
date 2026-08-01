@@ -14,7 +14,7 @@ def test_initialize_schema_and_pragmas(tmp_path: Path) -> None:
         }
         assert {"assets", "scan_runs", "schema_version"} <= tables
         assert database.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert database.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 1
+        assert database.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 2
 
 
 def test_run_history_is_retained(tmp_path: Path) -> None:

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
+from photo_migrator.hashing import HashEngine
 from photo_migrator.scanner import Scanner
 
 
@@ -22,6 +23,12 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--config", type=Path, required=True)
     stats = subparsers.add_parser("stats", help="show inventory statistics")
     stats.add_argument("--database", type=Path, required=True)
+    hash_command = subparsers.add_parser("hash", help="hash exact-duplicate candidates")
+    hash_command.add_argument("--database", type=Path, required=True)
+    hash_command.add_argument("--workers", type=int, default=1)
+    hash_command.add_argument("--limit", type=int)
+    hash_command.add_argument("--source")
+    hash_command.add_argument("--resume", action="store_true")
     return parser
 
 
@@ -45,6 +52,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"errors={len(result.errors)}"
             )
             return 0 if not result.errors else 2
+        if args.command == "hash":
+            with Database(args.database) as database:
+                database.initialize()
+                return HashEngine(database, args.workers).run(args.limit, args.source, args.resume)
         with Database(args.database) as database:
             database.initialize()
             stats = database.stats()
