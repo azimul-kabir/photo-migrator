@@ -20,6 +20,31 @@ Photo Migrator is a safety-first utility for consolidating overlapping photo and
 6. Build a clean library using copy or hardlink mode.
 7. Verify destination files before Immich indexing.
 
-## Status
+## Installation
 
-The repository is in its initial scaffolding phase. The first milestone is a read-only scanner and SQLite inventory.
+Python 3.9 or newer is required. Install the project with `uv`:
+
+```bash
+uv sync
+```
+
+Copy `config.example.toml`, set each source path, and then run:
+
+```bash
+uv run photo-migrator init --database inventory.db
+uv run photo-migrator scan --database inventory.db --config config.toml
+uv run photo-migrator stats --database inventory.db
+```
+
+Scanning is resumable: assets are upserted by absolute path, prior scan runs remain in the
+database, and files absent after a successful source scan are retained as missing.
+
+## Milestone 1 safety
+
+Milestone 1 performs **metadata-only filesystem scanning**. It reads directory entries and file
+stat metadata, but does not open or hash file contents. It does not copy, rename, move, hardlink,
+or delete media. Directory symlinks are not followed, and all discovered paths are checked for
+containment within their configured source root.
+
+Hashing, duplicate detection, EXIF extraction, library building, deletion, and Immich integration
+are intentionally outside this milestone.
