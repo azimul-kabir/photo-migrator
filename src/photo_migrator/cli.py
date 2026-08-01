@@ -11,6 +11,7 @@ from photo_migrator.analysis import AnalysisEngine
 from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
 from photo_migrator.hashing import HashEngine
+from photo_migrator.relationships import RelationshipEngine
 from photo_migrator.scanner import Scanner
 
 
@@ -38,6 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--resume", action="store_true")
     analyze.add_argument("--retry-failed", action="store_true")
     analyze.add_argument("--ffprobe", default="ffprobe")
+    relate = subparsers.add_parser("relate", help="detect Live and Motion Photo relationships")
+    relate.add_argument("--database", type=Path, required=True)
+    relate.add_argument("--workers", type=int, default=1)
+    relate.add_argument("--limit", type=int)
+    relate.add_argument("--source")
+    relate.add_argument("--resume", action="store_true")
+    relate.add_argument("--retry-failed", action="store_true")
+    relate.add_argument("--ffprobe", default="ffprobe")
     return parser
 
 
@@ -71,6 +80,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return AnalysisEngine(database, args.workers, args.ffprobe).run(
                     args.limit, args.source, args.resume, args.retry_failed
                 )
+        if args.command == "relate":
+            with Database(args.database) as database:
+                database.initialize()
+                return RelationshipEngine(database, args.workers, args.ffprobe).run(
+                    args.limit, args.source, args.resume, args.retry_failed
+                )
         with Database(args.database) as database:
             database.initialize()
             stats = database.stats()
@@ -98,6 +113,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             "Latest analysis-run status: "
             f"{latest_analysis['status'] if latest_analysis else 'none'}"
+        )
+        print(f"Active relationships: {stats['relationships_active']}")
+        print(f"Apple Live Photos: {stats['apple_live_photos']}")
+        print(f"Google Motion Photos: {stats['google_motion_photos']}")
+        print(f"Samsung Motion Photos: {stats['samsung_motion_photos']}")
+        print(f"Fallback filename pairs: {stats['filename_pairs']}")
+        print(f"Orphan motion images: {stats['orphan_motion_images']}")
+        print(f"Orphan motion videos: {stats['orphan_motion_videos']}")
+        print(f"Ambiguous relationships: {stats['ambiguous_relationships']}")
+        print(f"Invalid relationships: {stats['invalid_relationships']}")
+        latest_relationship = stats["latest_relationship_run"]
+        print(
+            "Latest relationship-run status: "
+            f"{latest_relationship['status'] if latest_relationship else 'none'}"
         )
         return 0
     except (ConfigError, OSError, ValueError) as exc:

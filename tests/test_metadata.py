@@ -136,5 +136,5 @@ def test_schema_upgrade_from_version_two(tmp_path: Path) -> None:
         assert {"analysis_status", "captured_at", "video_codec"} <= columns
         assert (
             database.connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-            == 3
+            == 4
         )

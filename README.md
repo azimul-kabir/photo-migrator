@@ -102,3 +102,45 @@ to be required for every image.
 Source files are opened read-only. No EXIF or media data is written, and no file is copied, moved,
 renamed, linked, transcoded, or deleted. Analysis only writes the configured inventory database and
 its adjacent `reports/` directory. Live Photo and Motion Photo pairing are not yet implemented.
+# Live and Motion Photo relationships
+
+Milestone 3B adds read-only relationship analysis after scanning (and preferably metadata
+analysis):
+
+```bash
+photo-migrator relate --database photo.db
+photo-migrator relate --database photo.db --workers 2
+photo-migrator relate --database photo.db --source MobileBackup --limit 500
+```
+
+`--resume`, `--retry-failed`, and `--ffprobe PATH` are available for interrupted/error
+recovery and video metadata inspection. Apple Live Photos are paired primarily with embedded
+content identifiers from image metadata and QuickTime tags. Google Pixel XMP motion flags and
+validated offsets, and explicit Samsung motion-photo markers, identify self-contained Motion
+Photos; the embedded motion video is recorded but **not extracted**.
+
+When identifiers are absent, the engine conservatively considers only supported image/video
+extensions with the same normalized stem and source, the same or a nearby directory, and capture
+times within three seconds when both exist. Apple's `IMG_E1234` edit name normalizes to
+`IMG_1234`. Conflicting identifiers are never overridden. Equal candidates are reported as
+ambiguous rather than selected; fallback pairing may require user review. Identifier-bearing
+unmatched components are reported as orphans, while ordinary standalone videos are not.
+
+Relationship state is stored in SQLite and analysis size/mtime snapshots make results auditable.
+Runs are retained and repeated results are reused without duplicate rows. Deterministic files in
+`reports/` are:
+
+* `relationship_summary.txt` — counts and latest run status;
+* `asset_relationships.csv` — normalized relationships and evidence;
+* `orphan_assets.csv` — unmatched supported components and errors;
+* `ambiguous_relationships.csv` — all equally plausible candidates.
+
+## Relationship safety and limitations
+
+Media files are opened read-only. No file is copied, moved, renamed, linked, rewritten,
+transcoded, or deleted, and no sidecar is edited. Metadata parsing is deliberately bounded and
+supports common XMP, QuickTime, and Samsung markers rather than every vendor-specific layout.
+Malformed metadata and offsets are surfaced as errors or invalid records. Separate-component
+Google/Samsung pairing requires explicit evidence; embedded video is never materialized. Keeper
+selection and migration planning remain unimplemented, as do conversion, perceptual matching,
+HTML output, and Immich integration.
