@@ -7,6 +7,7 @@ import logging
 from collections.abc import Sequence
 from pathlib import Path
 
+from photo_migrator.analysis import AnalysisEngine
 from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
 from photo_migrator.hashing import HashEngine
@@ -29,6 +30,14 @@ def build_parser() -> argparse.ArgumentParser:
     hash_command.add_argument("--limit", type=int)
     hash_command.add_argument("--source")
     hash_command.add_argument("--resume", action="store_true")
+    analyze = subparsers.add_parser("analyze", help="extract normalized media metadata")
+    analyze.add_argument("--database", type=Path, required=True)
+    analyze.add_argument("--workers", type=int, default=1)
+    analyze.add_argument("--limit", type=int)
+    analyze.add_argument("--source")
+    analyze.add_argument("--resume", action="store_true")
+    analyze.add_argument("--retry-failed", action="store_true")
+    analyze.add_argument("--ffprobe", default="ffprobe")
     return parser
 
 
@@ -56,6 +65,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             with Database(args.database) as database:
                 database.initialize()
                 return HashEngine(database, args.workers).run(args.limit, args.source, args.resume)
+        if args.command == "analyze":
+            with Database(args.database) as database:
+                database.initialize()
+                return AnalysisEngine(database, args.workers, args.ffprobe).run(
+                    args.limit, args.source, args.resume, args.retry_failed
+                )
         with Database(args.database) as database:
             database.initialize()
             stats = database.stats()
@@ -72,8 +87,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  {row['extension']}: {row['count']}")
         latest = stats["latest_run"]
         print(f"Latest scan-run status: {latest['status'] if latest else 'none'}")
+        print(f"Completed analyses: {stats['analyses_completed']}")
+        print(f"Failed analyses: {stats['analyses_failed']}")
+        print(f"Unsupported analyses: {stats['analyses_unsupported']}")
+        print(f"Assets with captured dates: {stats['with_captured_at']}")
+        print(f"Assets with GPS: {stats['with_gps']}")
+        print(f"Image count: {stats['images']}")
+        print(f"Video count: {stats['videos']}")
+        latest_analysis = stats["latest_analysis_run"]
+        print(
+            "Latest analysis-run status: "
+            f"{latest_analysis['status'] if latest_analysis else 'none'}"
+        )
         return 0
-    except (ConfigError, OSError) as exc:
+    except (ConfigError, OSError, ValueError) as exc:
         logging.error("%s", exc)
         return 2
 

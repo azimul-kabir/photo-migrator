@@ -5,7 +5,11 @@ description = "Safely inventory, deduplicate, plan, and build an Immich-ready ph
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [{ name = "Azimul Kabir" }]
-dependencies = ["tomli>=1.1.0; python_version < '3.11'"]
+dependencies = [
+  "Pillow>=10.0",
+  "pillow-heif>=0.16",
+  "tomli>=1.1.0; python_version < '3.11'",
+]
 
 [dependency-groups]
 dev = [
@@ -35,6 +39,10 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.9"
 strict = true
 mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["PIL", "PIL.*", "pillow_heif"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
