@@ -45,7 +45,7 @@ def test_one_sided_apple_identifier_pairs_same_directory_heic(tmp_path: Path) ->
     )
     result = build_relationships([image, video])
     assert [(row.status, row.relationship_type, row.confidence) for row in result] == [
-        ("active", "apple_live_photo", 0.9)
+        ("active", "apple_live_photo", 0.85)
     ]
     assert "fallback=one_sided_apple_identifier" in result[0].evidence
     assert "video_identifier=apple-id" in result[0].evidence
@@ -71,7 +71,7 @@ def test_one_sided_identifier_never_crosses_directories_or_sources(tmp_path: Pat
     assert [row.relationship_type for row in result] == ["orphan_motion_video"]
 
 
-def test_one_sided_identifier_rejects_timestamp_mismatch(tmp_path: Path) -> None:
+def test_one_sided_identifier_marks_timestamp_mismatch_for_review(tmp_path: Path) -> None:
     image = Inspection(
         with_time(asset(1, tmp_path / "IMG_1.heic"), "2024-01-01T00:00:00"),
         AppleIdentifier(),
@@ -82,9 +82,78 @@ def test_one_sided_identifier_rejects_timestamp_mismatch(tmp_path: Path) -> None
         AppleIdentifier("id", "video:test"),
         MotionDetection(),
     )
-    assert [row.relationship_type for row in build_relationships([image, video])] == [
-        "orphan_motion_video"
+    result = build_relationships([image, video])
+    assert [(row.status, row.relationship_type) for row in result] == [
+        ("ambiguous", "apple_live_photo")
     ]
+    assert "timestamp_classification=incompatible" in result[0].evidence
+
+
+@pytest.mark.parametrize(
+    ("image_time", "video_time", "classification", "confidence"),
+    [
+        (
+            "2024-06-01T12:00:00+06:00",
+            "2024-06-01T06:00:00Z",
+            "exact_within_3_seconds",
+            0.9,
+        ),
+        (
+            "2024-06-01T12:00:00",
+            "2024-06-01T12:00:00Z",
+            "same_wall_clock_within_3_seconds",
+            0.9,
+        ),
+        (
+            "2024-06-01T12:00:00",
+            "2024-06-01T06:00:00Z",
+            "timezone_offset_compatible",
+            0.9,
+        ),
+        (None, "2024-06-01T06:00:00Z", "unavailable", 0.85),
+        ("not-a-date", "2024-06-01T06:00:00Z", "unavailable", 0.85),
+    ],
+)
+def test_one_sided_identifier_classifies_mixed_or_unavailable_timestamps(
+    tmp_path: Path,
+    image_time: str | None,
+    video_time: str,
+    classification: str,
+    confidence: float,
+) -> None:
+    image_asset = asset(1, tmp_path / "IMG_1.heic")
+    if image_time is not None:
+        image_asset = with_time(image_asset, image_time)
+    image = Inspection(image_asset, AppleIdentifier(), MotionDetection())
+    video = Inspection(
+        with_time(asset(2, tmp_path / "IMG_1.mov"), video_time),
+        AppleIdentifier("id", "video:test"),
+        MotionDetection(),
+    )
+
+    result = build_relationships([image, video])
+
+    assert [(row.status, row.confidence) for row in result] == [("active", confidence)]
+    assert f"image_timestamp={image_time or 'unavailable'}" in result[0].evidence
+    assert f"video_timestamp={video_time}" in result[0].evidence
+    assert f"timestamp_classification={classification}" in result[0].evidence
+    assert not any(row.relationship_type == "orphan_motion_video" for row in result)
+
+
+def test_one_sided_identifier_different_calendar_dates_remain_review(tmp_path: Path) -> None:
+    image = Inspection(
+        with_time(asset(1, tmp_path / "IMG_1.heic"), "2024-01-01T12:00:00"),
+        AppleIdentifier(),
+        MotionDetection(),
+    )
+    video = Inspection(
+        with_time(asset(2, tmp_path / "IMG_1.mov"), "2024-02-01T12:00:00Z"),
+        AppleIdentifier("id", "video:test"),
+        MotionDetection(),
+    )
+    result = build_relationships([image, video])
+    assert result[0].status == "ambiguous"
+    assert "timestamp_classification=incompatible" in result[0].evidence
 
 
 def test_one_sided_identifier_multiple_images_is_ambiguous(tmp_path: Path) -> None:
@@ -121,12 +190,18 @@ def test_relationship_candidate_build_scales_to_thousands(tmp_path: Path) -> Non
         items.extend(
             (
                 Inspection(
-                    asset(index * 2 + 1, directory / "IMG_1.heic"),
+                    with_time(
+                        asset(index * 2 + 1, directory / "IMG_1.heic"),
+                        "2024-06-01T12:00:00",
+                    ),
                     AppleIdentifier(),
                     MotionDetection(),
                 ),
                 Inspection(
-                    asset(index * 2 + 2, directory / "IMG_1.mov"),
+                    with_time(
+                        asset(index * 2 + 2, directory / "IMG_1.mov"),
+                        "2024-06-01T06:00:00Z",
+                    ),
                     AppleIdentifier(f"id-{index}", "video:test"),
                     MotionDetection(),
                 ),
@@ -135,6 +210,9 @@ def test_relationship_candidate_build_scales_to_thousands(tmp_path: Path) -> Non
     result = build_relationships(items)
     assert len(result) == 2_500
     assert all(row.relationship_type == "apple_live_photo" for row in result)
+    assert all(
+        "timestamp_classification=timezone_offset_compatible" in row.evidence for row in result
+    )
 
 
 def test_identifier_pair_precedes_filename_fallback(tmp_path: Path) -> None:

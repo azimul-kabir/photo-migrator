@@ -133,11 +133,14 @@ Photos; the embedded motion video is recorded but **not extracted**.
 
 Exact image-to-video Apple identifiers are the highest-confidence pairs. When an identifier-bearing
 video's image identifier is missing (commonly after an export strips image metadata), a distinct
-one-sided Apple fallback requires the same source, exact parent directory, normalized stem, a
-timestamp difference of at most three seconds when both timestamps exist, and exactly one eligible
-image. It is recorded as an `apple_live_photo` at lower confidence than an exact identifier pair but
-higher confidence than a generic filename pair. Multiple eligible images are ambiguous, and reused
-`IMG_####` names in other folders are never considered by this Apple fallback.
+one-sided Apple fallback requires the same source, exact parent directory, normalized stem, and
+exactly one eligible image. Timestamps are classified as `exact_within_3_seconds`,
+`same_wall_clock_within_3_seconds`, `timezone_offset_compatible`, `unavailable`, or `incompatible`.
+The first three classifications produce a 0.90-confidence pair; missing or unparseable timestamps
+produce a 0.85-confidence pair because the exact directory/stem match remains strong. Clearly
+incompatible timestamps produce an ambiguous review record rather than an active pair. Multiple
+eligible images are also ambiguous, and reused `IMG_####` names in other folders are never
+considered by this Apple fallback.
 
 When identifiers are absent on both components, the engine conservatively considers only supported image/video
 extensions with the same normalized stem and source, the same or a nearby directory, and capture
@@ -157,9 +160,9 @@ inspections continue; the run then finishes `completed_with_errors`. Determinist
 
 * `relationship_summary.txt` — separate counts for exact Apple pairs, one-sided Apple fallbacks,
   generic filename fallbacks, genuine orphans, and the latest run status;
-* `asset_relationships.csv` — normalized relationships and evidence;
+* `asset_relationships.csv` — normalized relationships, timestamp classification, and evidence;
 * `orphan_assets.csv` — unmatched supported components and errors;
-* `ambiguous_relationships.csv` — all equally plausible candidates.
+* `ambiguous_relationships.csv` — all review candidates and timestamp classifications.
 
 ## Relationship safety and limitations
 
