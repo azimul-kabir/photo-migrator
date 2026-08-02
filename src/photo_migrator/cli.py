@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from collections.abc import Sequence
 from pathlib import Path
 
+from photo_migrator import __version__
 from photo_migrator.analysis import AnalysisEngine
 from photo_migrator.builder import Builder, Rollback
 from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
+from photo_migrator.db_tools import backup_database, check_database
+from photo_migrator.doctor import run_doctor
 from photo_migrator.hashing import HashEngine
+from photo_migrator.logging_config import configure_logging
 from photo_migrator.planner import Planner
+from photo_migrator.recovery import audit
 from photo_migrator.relationships import RelationshipEngine
 from photo_migrator.scanner import Scanner
 from photo_migrator.verifier import Verifier
@@ -20,6 +26,12 @@ from photo_migrator.verifier import Verifier
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="photo-migrator")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO"
+    )
+    parser.add_argument("--log-format", choices=("text", "json"), default="text")
+    parser.add_argument("--log-file", type=Path)
     subparsers = parser.add_subparsers(dest="command", required=True)
     init = subparsers.add_parser("init", help="initialize an inventory database")
     init.add_argument("--database", type=Path, required=True)
@@ -82,13 +94,80 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--build-run-id", type=int, required=True)
     rollback.add_argument("--dry-run", action="store_true")
     rollback.add_argument("--confirm-owned-files-only", action="store_true")
+    doctor = subparsers.add_parser("doctor", help="audit environment and database safety")
+    doctor.add_argument("--database", type=Path, required=True)
+    doctor.add_argument("--config", type=Path)
+    doctor.add_argument("--plan-id", type=int)
+    doctor.add_argument("--check-hardlinks", action="store_true")
+    doctor.add_argument("--check-write-access", action="store_true")
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--strict", action="store_true")
+    db = subparsers.add_parser("db", help="database safety utilities")
+    db_commands = db.add_subparsers(dest="db_command", required=True)
+    backup = db_commands.add_parser("backup", help="create an atomic SQLite online backup")
+    backup.add_argument("--database", type=Path, required=True)
+    backup.add_argument("--output", type=Path, required=True)
+    backup.add_argument("--overwrite", action="store_true")
+    backup.add_argument("--verify", action="store_true")
+    check = db_commands.add_parser("check", help="check database integrity without repair")
+    check.add_argument("--database", type=Path, required=True)
+    check.add_argument("--full", action="store_true")
+    check.add_argument("--json", action="store_true")
+    recover = subparsers.add_parser("recover", help="audit interrupted runs without file changes")
+    recover.add_argument("--database", type=Path, required=True)
+    recover.add_argument("--json", action="store_true")
+    recover.add_argument("--mark-stale-failed", action="store_true")
+    recover.add_argument("--older-than-minutes", type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
+    configure_logging(args.log_level, args.log_format, args.log_file)
     try:
+        if args.command == "doctor":
+            diagnostic, code = run_doctor(
+                args.database,
+                args.config,
+                args.plan_id,
+                args.check_hardlinks,
+                args.check_write_access,
+                args.strict,
+            )
+            print(
+                json.dumps(diagnostic, indent=2, sort_keys=True)
+                if args.json
+                else "\n".join(
+                    f"{item['status']:4} {item['name']}: {item['message']}"
+                    for item in diagnostic["checks"]
+                )
+            )
+            return code
+        if args.command == "db":
+            if args.db_command == "backup":
+                print(
+                    json.dumps(
+                        backup_database(args.database, args.output, args.overwrite, args.verify),
+                        indent=2,
+                        sort_keys=True,
+                    )
+                )
+                return 0
+            db_result = check_database(args.database, args.full)
+            print(
+                json.dumps(db_result, indent=2, sort_keys=True)
+                if args.json
+                else f"{db_result['check']}: {', '.join(db_result['integrity'])}; schema={db_result['schema_version']}"
+            )
+            return 0 if db_result["ok"] else 2
+        if args.command == "recover":
+            recovery_result = audit(args.database, args.older_than_minutes, args.mark_stale_failed)
+            print(
+                json.dumps(recovery_result, indent=2, sort_keys=True)
+                if args.json
+                else f"Stale runs: {len(recovery_result['stale_runs'])}; records updated: {recovery_result['records_updated']}"
+            )
+            return 1 if recovery_result["stale_runs"] and not args.mark_stale_failed else 0
         if args.command == "init":
             args.database.parent.mkdir(parents=True, exist_ok=True)
             with Database(args.database) as database:
@@ -247,6 +326,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ConfigError, OSError, ValueError) as exc:
         logging.error("%s", exc)
         return 2
+    except KeyboardInterrupt:
+        logging.error(
+            "Interrupted by user; completed work is preserved. Run 'photo-migrator recover --database PATH' before resuming."
+        )
+        return 130
 
 
 if __name__ == "__main__":

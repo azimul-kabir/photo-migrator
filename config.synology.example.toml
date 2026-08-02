@@ -1,0 +1,37 @@
+# REVIEW AND EDIT every path before use. This file contains no secrets.
+[[sources]]
+name = "originals"
+path = "/volume1/photo/originals"
+priority = 100
+[[sources]]
+name = "apple-photos"
+path = "/volume1/photo/Apple Photos"
+priority = 90
+[[sources]]
+name = "photo-library"
+path = "/volume1/photo/PhotoLibrary"
+priority = 80
+[[sources]]
+name = "mobile-backup"
+path = "/volume1/photo/MobileBackup"
+priority = 70
+[[sources]]
+name = "ios"
+path = "/volume1/photo/ios"
+priority = 60
+[[sources]]
+name = "family-videos"
+path = "/volume1/photo/family videos"
+priority = 50
+[scan]
+extensions = [".jpg", ".jpeg", ".png", ".heic", ".mov", ".mp4"]
+exclude_directory_names = ["@eaDir", "#recycle", "Photos Library.photoslibrary", "CleanLibrary"]
+exclude_filename_suffixes = []
+exclude_filename_prefixes = []
+[planning]
+destination_root = "/volume1/photo/CleanLibrary"
+date_fallback = "undated"
+naming_template = "{year}/{year}-{month}/{timestamp}_{original_name}"
+preserve_source_subdirectories = false
+case_insensitive_destination = true
+max_filename_length = 180

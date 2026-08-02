@@ -39,6 +39,10 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 "src/photo_migrator/database.py" = ["E501"]
 "src/photo_migrator/planner.py" = ["E501"]
 "src/photo_migrator/builder.py" = ["E501"]
+"src/photo_migrator/cli.py" = ["E501"]
+"src/photo_migrator/db_tools.py" = ["E501"]
+"src/photo_migrator/doctor.py" = ["E501"]
+"src/photo_migrator/recovery.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.9"

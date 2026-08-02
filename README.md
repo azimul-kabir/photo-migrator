@@ -243,3 +243,21 @@ Each run writes deterministic files under `reports/build_<BUILD_RUN_ID>/`:
 `rollback_results.csv`. SQLite permanently retains build snapshots, item-level source/destination
 hashes, ownership, verification state, byte counts, errors, and rollback state. `photo-migrator
 stats` also shows the latest build and rollback counters.
+
+## Production hardening and support
+
+Release **0.1.0** supports Python 3.9–3.12 on Linux (including compatible Synology DSM environments) and macOS; Windows is not claimed. The package metadata is the authoritative version and follows semantic versioning while the project is pre-1.0. CI tests every supported Python version.
+
+```sh
+uv sync
+uv sync --dev
+uv run photo-migrator --version
+uv run photo-migrator doctor --database photo.db --config config.toml --strict
+uv run photo-migrator db check --database photo.db --full
+uv run photo-migrator db backup --database photo.db --output photo.backup.db --verify
+uv run photo-migrator recover --database photo.db --json
+```
+
+Global `--log-level DEBUG|INFO|WARNING|ERROR`, `--log-format text|json`, and `--log-file PATH` options provide diagnostics. JSON records contain timestamps, severity, logger and message, plus operation context when available. Exit codes are 0 success, 1 warnings/partial audit findings, 2 validation or safety failure, and 130 user interruption.
+
+Read the [Synology guide](docs/synology.md) and [safe first-run runbook](docs/first-run.md). Production use must begin with a small test source and copy mode. Do not delete sources until independent verification and backup exist. Photo Migrator cannot protect against disk failure, RAID is not a backup, and Photo Migrator does not manage Immich or its API yet. This is a pre-1.0 release: retain sources and independently inspect all reports.
