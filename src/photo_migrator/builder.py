@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import os
 import sqlite3
 import stat
@@ -10,6 +9,7 @@ from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.build_models import BuildOperationResult, BuildPlanItem, RollbackResult
 from photo_migrator.database import Database, utc_now
 from photo_migrator.filesystem_safety import (
@@ -435,8 +435,8 @@ class Builder:
             "elapsed time": "recorded timestamps",
             "final build status": run["status"],
         }
-        (directory / "build_summary.txt").write_text(
-            "".join(f"{k}: {v}\n" for k, v in summary.items()), encoding="utf-8"
+        atomic_write_text(
+            directory / "build_summary.txt", "".join(f"{k}: {v}\n" for k, v in summary.items())
         )
         fields = [
             "id",
@@ -552,16 +552,17 @@ class Builder:
 
     @staticmethod
     def _csv(path: Path, rows: Sequence[object], fields: list[str]) -> None:
-        with path.open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.writer(stream, lineterminator="\n")
-            writer.writerow(fields)
-            for row in rows:
-                writer.writerow(
-                    [
-                        row[field] if isinstance(row, (dict, sqlite3.Row)) and field in row else ""
-                        for field in fields
-                    ]
-                )
+        atomic_write_csv(
+            path,
+            (
+                [
+                    row[field] if isinstance(row, (dict, sqlite3.Row)) and field in row else ""
+                    for field in fields
+                ]
+                for row in rows
+            ),
+            fields,
+        )
 
 
 class Rollback:

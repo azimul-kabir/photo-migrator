@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import logging
 import time
@@ -10,6 +9,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.database import Database, utc_now
 
 LOGGER = logging.getLogger(__name__)
@@ -224,14 +224,14 @@ class HashEngine:
             "SELECT COUNT(*) FROM assets WHERE hash_status='failed'"
         ).fetchone()[0]
         largest = max((row["copies"] for row in rows), default=0)
-        (report_dir / "hash_summary.txt").write_text(
+        atomic_write_text(
+            report_dir / "hash_summary.txt",
             f"candidate count: {candidate_count}\n"
             f"hashed count: {hashed_count}\nfailed count: {failed_count}\n"
             f"duplicate groups: {len(rows)}\nlargest duplicate group: {largest}\n",
-            encoding="utf-8",
         )
-        with (report_dir / "duplicate_groups.csv").open("w", encoding="utf-8", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow(["sha256", "copies", "size_bytes", "total_bytes", "paths"])
-            for row in duplicate_files:
-                writer.writerow(row)
+        atomic_write_csv(
+            report_dir / "duplicate_groups.csv",
+            duplicate_files,
+            ["sha256", "copies", "size_bytes", "total_bytes", "paths"],
+        )

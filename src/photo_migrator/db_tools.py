@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import sqlite3
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from photo_migrator.atomic_io import atomic_write_json
 
 RUN_TABLES = (
     "scan_runs",
@@ -91,21 +92,6 @@ def schema_version_from(path: Path) -> int | None:
         return schema_version(connection)
 
 
-def atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(value, stream, indent=2, sort_keys=True)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
 def backup_database(source: Path, output: Path, overwrite: bool, verify: bool) -> dict[str, Any]:
     source = source.resolve(strict=True)
     output = output.resolve(strict=False)
@@ -137,7 +123,7 @@ def backup_database(source: Path, output: Path, overwrite: bool, verify: bool) -
             "verification_status": status,
             "sha256": sha256_file(output),
         }
-        atomic_json(Path(f"{output}.json"), metadata)
+        atomic_write_json(Path(f"{output}.json"), metadata)
         return metadata
     finally:
         temporary.unlink(missing_ok=True)

@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import sqlite3
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, PlanningConfig
 from photo_migrator.database import Database, utc_now
 from photo_migrator.naming import collision_key, destination_path, disambiguate
@@ -539,15 +539,12 @@ class Planner:
             "naming template": self.planning.naming_template,
             "configuration fingerprint": fingerprint,
         }
-        (directory / "plan_summary.txt").write_text(
-            "".join(f"{k}: {v}\n" for k, v in lines.items()), encoding="utf-8"
+        atomic_write_text(
+            directory / "plan_summary.txt", "".join(f"{k}: {v}\n" for k, v in lines.items())
         )
 
-        def write(name: str, header: list[str], rows: Iterable[Iterable[object]]) -> None:
-            with (directory / name).open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.writer(stream, lineterminator="\n")
-                writer.writerow(header)
-                writer.writerows(rows)
+        def write(name: str, header: list[str], rows: Iterable[Sequence[object]]) -> None:
+            atomic_write_csv(directory / name, rows, header)
 
         write(
             "keeper_decisions.csv",

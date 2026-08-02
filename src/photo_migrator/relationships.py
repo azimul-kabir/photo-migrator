@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +13,7 @@ from photo_migrator.apple_live_photos import (
     inspect_video,
     normalize_stem,
 )
+from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.database import Database, utc_now
 from photo_migrator.motion_photos import MotionDetection, inspect_motion_photo
 
@@ -447,81 +447,82 @@ class RelationshipEngine:
             JOIN assets p ON p.id=r.primary_asset_id LEFT JOIN assets s ON s.id=r.secondary_asset_id
             ORDER BY r.relationship_type,p.absolute_path,COALESCE(s.absolute_path,'')"""
         ).fetchall()
-        with (directory / "asset_relationships.csv").open("w", newline="", encoding="utf-8") as out:
-            writer = csv.writer(out, lineterminator="\n")
-            writer.writerow(
-                (
-                    "relationship_type",
-                    "status",
-                    "confidence",
-                    "primary_asset_id",
-                    "primary_path",
-                    "secondary_asset_id",
-                    "secondary_path",
-                    "evidence",
-                )
-            )
-            for row in rows:
-                writer.writerow(
-                    tuple(
-                        row[key]
-                        for key in (
-                            "relationship_type",
-                            "status",
-                            "confidence",
-                            "primary_asset_id",
-                            "primary_path",
-                            "secondary_asset_id",
-                            "secondary_path",
-                            "evidence",
-                        )
+        atomic_write_csv(
+            directory / "asset_relationships.csv",
+            (
+                tuple(
+                    row[key]
+                    for key in (
+                        "relationship_type",
+                        "status",
+                        "confidence",
+                        "primary_asset_id",
+                        "primary_path",
+                        "secondary_asset_id",
+                        "secondary_path",
+                        "evidence",
                     )
                 )
-        with (directory / "orphan_assets.csv").open("w", newline="", encoding="utf-8") as out:
-            writer = csv.writer(out, lineterminator="\n")
-            writer.writerow(
+                for row in rows
+            ),
+            (
+                "relationship_type",
+                "status",
+                "confidence",
+                "primary_asset_id",
+                "primary_path",
+                "secondary_asset_id",
+                "secondary_path",
+                "evidence",
+            ),
+        )
+        atomic_write_csv(
+            directory / "orphan_assets.csv",
+            (
                 (
-                    "relationship_type",
-                    "asset_id",
-                    "absolute_path",
-                    "source_name",
-                    "evidence",
-                    "relationship_error",
+                    row["relationship_type"],
+                    row["primary_asset_id"],
+                    row["primary_path"],
+                    row["source_name"],
+                    row["evidence"],
+                    row["relationship_error"],
                 )
-            )
-            for row in rows:
-                if row["status"] == "orphan":
-                    writer.writerow(
-                        (
-                            row["relationship_type"],
-                            row["primary_asset_id"],
-                            row["primary_path"],
-                            row["source_name"],
-                            row["evidence"],
-                            row["relationship_error"],
-                        )
+                for row in rows
+                if row["status"] == "orphan"
+            ),
+            (
+                "relationship_type",
+                "asset_id",
+                "absolute_path",
+                "source_name",
+                "evidence",
+                "relationship_error",
+            ),
+        )
+        ambiguous_rows = []
+        for row in rows:
+            if row["status"] == "ambiguous":
+                evidence = row["evidence"]
+                ambiguous_rows.append(
+                    (
+                        row["primary_asset_id"],
+                        row["primary_path"],
+                        _evidence_value(evidence, "candidate_asset_ids"),
+                        _evidence_value(evidence, "candidate_paths"),
+                        evidence,
                     )
-        with (directory / "ambiguous_relationships.csv").open(
-            "w", newline="", encoding="utf-8"
-        ) as out:
-            writer = csv.writer(out, lineterminator="\n")
-            writer.writerow(
-                (
-                    "primary_asset_id",
-                    "primary_path",
-                    "candidate_asset_ids",
-                    "candidate_paths",
-                    "evidence",
                 )
-            )
-            for row in rows:
-                if row["status"] == "ambiguous":
-                    evidence = row["evidence"]
-                    ids = _evidence_value(evidence, "candidate_asset_ids")
-                    paths = _evidence_value(evidence, "candidate_paths")
-                    writer.writerow(
-                        (row["primary_asset_id"], row["primary_path"], ids, paths, evidence)
-                    )
+        atomic_write_csv(
+            directory / "ambiguous_relationships.csv",
+            ambiguous_rows,
+            (
+                "primary_asset_id",
+                "primary_path",
+                "candidate_asset_ids",
+                "candidate_paths",
+                "evidence",
+            ),
+        )
         stats = self.database.stats()
         latest = stats["latest_relationship_run"]
         labels = (
@@ -539,8 +540,9 @@ class RelationshipEngine:
             ("Reused count", latest["relationships_reused"] if latest else 0),
             ("Latest run status", latest["status"] if latest else "none"),
         )
-        (directory / "relationship_summary.txt").write_text(
-            "".join(f"{label}: {value}\n" for label, value in labels), encoding="utf-8"
+        atomic_write_text(
+            directory / "relationship_summary.txt",
+            "".join(f"{label}: {value}\n" for label, value in labels),
         )
 
 

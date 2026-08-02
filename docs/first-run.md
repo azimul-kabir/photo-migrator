@@ -1,5 +1,10 @@
 # Safe first run
 
+Use `uv sync --frozen` (`--dev` on a validation workstation). Before configuring real sources,
+run `uv run pytest tests/test_end_to_end.py` and confirm the Python 3.9–3.12 CI matrix is green for
+the deployed commit. Create and verify a database backup immediately before the first full build
+and another after successful verification; retain both backups and their JSON sidecars.
+
 1. Clone the repository, run `uv sync --frozen --dev`, then `uv run photo-migrator --version`.
 2. Copy `config.synology.example.toml` to `config.toml`; review every source, priority, exclusion, and destination.
 3. Run `uv run photo-migrator doctor --database /path/photo.db --config config.toml --strict`.
