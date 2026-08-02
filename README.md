@@ -188,3 +188,58 @@ Each `reports/plan_<id>/` contains `plan_summary.txt`, `keeper_decisions.csv`,
 `review_items.csv`, and `blocked_items.csv`. Reports include source paths solely for auditability.
 Current limitations are planning-only: no build, conversion, EXIF writing, embedded-video
 extraction, perceptual matching, HTML, or Immich integration is performed.
+
+## Controlled library builds, verification, and rollback
+
+Milestone 5 can execute a reviewed plan while remaining read-only toward every source. A `ready`
+plan can be built directly; a `draft` plan requires `--allow-draft`, and `blocked` or `superseded`
+plans are rejected. The destination root and plan fingerprint are snapshotted in SQLite when the
+build starts, so later configuration cannot redirect an existing run. The builder rechecks that the
+stored destination does not overlap any recorded source root.
+
+`photo-migrator build --database photo.db --plan-id 12` is a **dry-run by default**. It verifies
+source path type, containment, size, mtime, and SHA-256, records results, and writes reports, but it
+does not create the destination root, directories, or media. Real writes require either
+`--mode copy` or `--mode hardlink`; `--workers` controls read/copy/hash workers and SQLite updates
+remain coordinated on one connection. Only `keep` and `include_relationship_member` items execute.
+Review, blocked, and exact-duplicate-skip actions never become destination files. Use `--limit` for a
+deterministic prefix and explicit `--resume` to reassess a compatible prior run snapshot.
+
+Copy mode streams to a uniquely created `.photo-migrator-<run>-<item>.tmp` file in the final
+ directory, fsyncs and SHA-256 verifies that temporary file, preserves atime/mtime, then atomically
+links it into the unused final name and verifies the final content. It never writes directly to or
+overwrites a final name. Filesystem support for directory fsync varies, so unsupported directory
+fsync is best-effort; file fsync and content verification remain mandatory.
+
+Hardlink mode re-verifies the source, requires the source and destination directory to be on the
+same filesystem, creates a non-following hardlink, and checks device/inode identity and destination
+SHA-256. A hardlink shares the source inode: destination content and metadata must therefore never
+be modified. The builder does not call chmod, chown, utime, or extended-attribute operations in
+hardlink mode. Unlinking an owned destination link during rollback does not remove source content
+while the source link remains.
+
+Every destination component is checked with `lstat`; symlink components and non-directory parents
+are rejected, and lexical plus resolved containment is checked immediately before use. There is no
+overwrite option. Existing identical regular files are verified and skipped without being claimed;
+conflicting files or any symlink/non-regular destination fail visibly and remain untouched.
+
+Run `photo-migrator verify --database photo.db --build-run-id 7` to recheck only that run's recorded
+paths. Verification never scans unrelated paths and never repairs media; `--repair-metadata-only`
+only permits refreshing SQLite verification state. Missing files, changed sizes/hashes, and invalid
+path types are recorded as verification failures.
+
+`photo-migrator rollback --database photo.db --build-run-id 7` is a dry-run. Real deletion requires
+`--confirm-owned-files-only`. Rollback removes only an exact recorded, regular, non-symlink file
+owned by that build run whose current SHA-256 still matches the successful build record.
+Pre-existing identical files are never claimed, included in the rollback plan, or removed. Changed
+owned files require manual review. Directories are left intact because directory ownership is not
+tracked, and rollback is idempotent. Source deletion, moving, renaming, metadata editing, automatic
+cleanup, content repair, transcoding, embedded-video extraction, and Immich API integration remain
+unimplemented.
+
+Each run writes deterministic files under `reports/build_<BUILD_RUN_ID>/`:
+`build_summary.txt`, `build_items.csv`, `failed_items.csv`, `verification_results.csv`,
+`bundle_results.csv`, `existing_destination_items.csv`, `rollback_plan.csv`, and
+`rollback_results.csv`. SQLite permanently retains build snapshots, item-level source/destination
+hashes, ownership, verification state, byte counts, errors, and rollback state. `photo-migrator
+stats` also shows the latest build and rollback counters.

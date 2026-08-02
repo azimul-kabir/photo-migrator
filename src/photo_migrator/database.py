@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def utc_now() -> str:
@@ -190,6 +190,44 @@ class Database:
                     role TEXT NOT NULL CHECK(role IN ('primary','relationship_member','duplicate_skipped')),
                     PRIMARY KEY(plan_item_id, asset_id, role)
                 );
+                CREATE TABLE IF NOT EXISTS build_runs (
+                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES migration_plans(id),
+                    started_at TEXT NOT NULL, finished_at TEXT,
+                    status TEXT NOT NULL CHECK(status IN ('running','completed','completed_with_errors','failed','rolled_back','rollback_failed')),
+                    mode TEXT NOT NULL CHECK(mode IN ('dry_run','copy','hardlink')),
+                    dry_run INTEGER NOT NULL CHECK(dry_run IN (0,1)),
+                    requested_items INTEGER NOT NULL DEFAULT 0, completed_items INTEGER NOT NULL DEFAULT 0,
+                    skipped_items INTEGER NOT NULL DEFAULT 0, failed_items INTEGER NOT NULL DEFAULT 0,
+                    verified_items INTEGER NOT NULL DEFAULT 0, verification_failed_items INTEGER NOT NULL DEFAULT 0,
+                    bytes_written INTEGER NOT NULL DEFAULT 0,
+                    rollback_status TEXT NOT NULL DEFAULT 'not_requested' CHECK(rollback_status IN ('not_requested','running','completed','completed_with_errors','failed')),
+                    message TEXT, plan_fingerprint TEXT NOT NULL, plan_status TEXT NOT NULL,
+                    destination_root TEXT NOT NULL, resumed_from_build_run_id INTEGER REFERENCES build_runs(id)
+                );
+                CREATE TABLE IF NOT EXISTS build_items (
+                    id INTEGER PRIMARY KEY, build_run_id INTEGER NOT NULL REFERENCES build_runs(id),
+                    plan_item_id INTEGER NOT NULL REFERENCES migration_plan_items(id),
+                    asset_id INTEGER NOT NULL REFERENCES assets(id), source_path TEXT NOT NULL,
+                    source_root TEXT NOT NULL, destination_relative_path TEXT NOT NULL CHECK(destination_relative_path NOT LIKE '/%' AND destination_relative_path NOT LIKE '../%' AND destination_relative_path NOT LIKE '%/../%' AND destination_relative_path != '..'),
+                    destination_absolute_path TEXT NOT NULL,
+                    operation TEXT NOT NULL CHECK(operation IN ('dry_run','copy','hardlink','skip','verify','rollback_delete')),
+                    status TEXT NOT NULL CHECK(status IN ('pending','running','completed','skipped','failed','verification_failed','rolled_back','rollback_failed')),
+                    expected_sha256 TEXT NOT NULL, actual_sha256 TEXT, expected_size_bytes INTEGER NOT NULL,
+                    actual_size_bytes INTEGER, expected_source_mtime_ns INTEGER, observed_source_mtime_ns INTEGER,
+                    bytes_written INTEGER NOT NULL DEFAULT 0, source_verified INTEGER NOT NULL DEFAULT 0 CHECK(source_verified IN (0,1)),
+                    destination_verified INTEGER NOT NULL DEFAULT 0 CHECK(destination_verified IN (0,1)),
+                    owned_by_build INTEGER NOT NULL DEFAULT 0 CHECK(owned_by_build IN (0,1)),
+                    started_at TEXT, finished_at TEXT, error TEXT, bundle_key TEXT NOT NULL,
+                    temp_path TEXT,
+                    UNIQUE(build_run_id,plan_item_id,asset_id),
+                    CHECK(status != 'completed' OR operation NOT IN ('copy','hardlink') OR owned_by_build=1)
+                );
+                CREATE INDEX IF NOT EXISTS idx_build_items_run ON build_items(build_run_id);
+                CREATE INDEX IF NOT EXISTS idx_build_items_plan_item ON build_items(plan_item_id);
+                CREATE INDEX IF NOT EXISTS idx_build_items_asset ON build_items(asset_id);
+                CREATE INDEX IF NOT EXISTS idx_build_items_status ON build_items(status);
+                CREATE INDEX IF NOT EXISTS idx_build_items_destination ON build_items(destination_absolute_path);
+                CREATE INDEX IF NOT EXISTS idx_build_items_owned ON build_items(owned_by_build);
                 """
             )
             columns = {
@@ -417,6 +455,9 @@ class Database:
         latest_plan = connection.execute(
             "SELECT * FROM migration_plans ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        latest_build = connection.execute(
+            "SELECT * FROM build_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
         plan_counts = None
         if latest_plan is not None:
             plan_counts = connection.execute(
@@ -464,4 +505,5 @@ class Database:
             "latest_relationship_run": latest_relationship,
             "latest_plan": latest_plan,
             "latest_plan_counts": plan_counts,
+            "latest_build_run": latest_build,
         }
