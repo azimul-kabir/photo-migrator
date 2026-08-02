@@ -2,6 +2,12 @@
 
 Photo Migrator is a safety-first utility for consolidating overlapping photo and video archives into one deduplicated, verified library suitable for Immich.
 
+The project lockfile is the deployment contract for Python 3.9–3.12. Use
+`uv sync --frozen --dev` for development or `uv sync --frozen` for runtime deployment. CI performs
+the frozen install and all checks on each supported Python version. Reports and JSON sidecars are
+written through same-directory, flushed atomic replacements, so a failed regeneration preserves
+the previous complete report. The end-to-end smoke test uses temporary synthetic assets only.
+
 ## Core guarantees
 
 - Source files are read-only.

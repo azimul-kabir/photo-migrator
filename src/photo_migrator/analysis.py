@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import csv
 import sqlite3
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.database import Database, utc_now
 from photo_migrator.image_metadata import ImageAnalyzer
 from photo_migrator.metadata import AnalyzerResult
@@ -286,48 +286,50 @@ class AnalysisEngine:
             f"assets with camera make/model: {counts['camera'] or 0}\n"
             f"ffprobe path used: {self.ffprobe}\nlatest run status: {latest['status']}\n"
         )
-        (report_dir / "metadata_summary.txt").write_text(summary, encoding="utf-8")
+        atomic_write_text(report_dir / "metadata_summary.txt", summary)
         camera_rows = connection.execute(
             """SELECT COALESCE(camera_make,'') camera_make,COALESCE(camera_model,'') camera_model,
                COUNT(*) asset_count FROM assets WHERE scan_status='available'
                AND (camera_make IS NOT NULL OR camera_model IS NOT NULL)
                GROUP BY camera_make,camera_model ORDER BY camera_make,camera_model"""
         ).fetchall()
-        with (report_dir / "camera_statistics.csv").open("w", encoding="utf-8", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow(["camera_make", "camera_model", "asset_count"])
-            writer.writerows(camera_rows)
+        atomic_write_csv(
+            report_dir / "camera_statistics.csv",
+            camera_rows,
+            ["camera_make", "camera_model", "asset_count"],
+        )
         rows = connection.execute(
             """SELECT absolute_path,source_name,media_type,analysis_status,analysis_error,
                captured_at,
                width,height,camera_make,camera_model,gps_latitude,gps_longitude,duration_seconds,
                video_codec FROM assets WHERE scan_status='available' ORDER BY absolute_path"""
         )
-        with (report_dir / "missing_metadata.csv").open("w", encoding="utf-8", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow(
-                [
-                    "absolute_path",
-                    "source_name",
-                    "media_type",
-                    "analysis_status",
-                    "missing_fields",
-                    "analysis_error",
-                ]
-            )
-            for row in rows:
-                missing = self._missing_fields(row)
-                if missing or row["analysis_error"]:
-                    writer.writerow(
-                        [
-                            row["absolute_path"],
-                            row["source_name"],
-                            row["media_type"],
-                            row["analysis_status"],
-                            ";".join(missing),
-                            row["analysis_error"] or "",
-                        ]
-                    )
+        missing_rows = []
+        for row in rows:
+            missing = self._missing_fields(row)
+            if missing or row["analysis_error"]:
+                missing_rows.append(
+                    [
+                        row["absolute_path"],
+                        row["source_name"],
+                        row["media_type"],
+                        row["analysis_status"],
+                        ";".join(missing),
+                        row["analysis_error"] or "",
+                    ]
+                )
+        atomic_write_csv(
+            report_dir / "missing_metadata.csv",
+            missing_rows,
+            [
+                "absolute_path",
+                "source_name",
+                "media_type",
+                "analysis_status",
+                "missing_fields",
+                "analysis_error",
+            ],
+        )
 
     @staticmethod
     def _missing_fields(values: sqlite3.Row) -> list[str]:
