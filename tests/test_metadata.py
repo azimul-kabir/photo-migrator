@@ -5,10 +5,12 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
+from PIL import Image
 
 from photo_migrator.analysis import AnalysisEngine
 from photo_migrator.database import Database, utc_now
-from photo_migrator.image_metadata import gps_coordinate, normalize_timestamp
+from photo_migrator.image_metadata import ImageAnalyzer, gps_coordinate, normalize_timestamp
+from photo_migrator.metadata import AnalyzerResult, MediaMetadata
 from photo_migrator.video_metadata import VideoAnalyzer, parse_ffprobe, parse_frame_rate
 
 
@@ -84,6 +86,104 @@ def test_video_analyzer_missing_timeout_and_bad_json(tmp_path: Path) -> None:
     process = Mock(returncode=0, stdout="not-json", stderr="")
     with patch("subprocess.run", return_value=process):
         assert "malformed ffprobe JSON" in (VideoAnalyzer().analyze(path).error or "")
+
+
+def test_decompression_bomb_is_a_structured_failure_without_disabling_limit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "oversized.jpg"
+    path.write_bytes(b"synthetic")
+    original_limit = Image.MAX_IMAGE_PIXELS
+    error = Image.DecompressionBombError(
+        "Image size (199756800 pixels) exceeds limit of 178956970 pixels."
+    )
+
+    with patch("photo_migrator.image_metadata.Image.open", side_effect=error):
+        result = ImageAnalyzer().analyze(path)
+
+    assert result.status == "failed"
+    assert result.metadata is None
+    assert result.error is not None
+    assert "DecompressionBombError" in result.error
+    assert "199756800 pixels" in result.error
+    assert f"MAX_IMAGE_PIXELS={original_limit}" in result.error
+    assert original_limit == Image.MAX_IMAGE_PIXELS
+
+
+def test_worker_exception_isolated_and_other_assets_continue(tmp_path: Path) -> None:
+    broken = tmp_path / "a.jpg"
+    healthy = tmp_path / "b.jpg"
+    broken.write_bytes(b"broken")
+    healthy.write_bytes(b"healthy")
+    database_path = tmp_path / "inventory.db"
+
+    with Database(database_path) as database:
+        database.initialize()
+        _asset(database, broken, "image")
+        _asset(database, healthy, "image")
+        successful = AnalyzerResult("completed", MediaMetadata(width=2, height=3))
+
+        def analyze(path: Path) -> AnalyzerResult:
+            if path == broken:
+                raise RuntimeError("worker exploded")
+            return successful
+
+        with patch.object(ImageAnalyzer, "analyze", side_effect=analyze):
+            assert AnalysisEngine(database, workers=2).run() == 2
+
+        assets = database.connection.execute(
+            "SELECT filename,analysis_status,analysis_error FROM assets ORDER BY filename"
+        ).fetchall()
+        assert tuple(assets[0]) == (
+            "a.jpg",
+            "failed",
+            "analysis worker error: RuntimeError: worker exploded",
+        )
+        assert tuple(assets[1]) == ("b.jpg", "completed", None)
+        run = database.connection.execute(
+            "SELECT status,analyzed_files,failed_files FROM analysis_runs"
+        ).fetchone()
+        assert tuple(run) == ("completed_with_errors", 1, 1)
+
+
+def test_stale_running_is_requeued_while_completed_asset_is_reused(tmp_path: Path) -> None:
+    stale = tmp_path / "stale.jpg"
+    completed = tmp_path / "completed.jpg"
+    stale.write_bytes(b"stale")
+    completed.write_bytes(b"completed")
+    database_path = tmp_path / "inventory.db"
+
+    with Database(database_path) as database:
+        database.initialize()
+        _asset(database, stale, "image")
+        _asset(database, completed, "image")
+        completed_stat = completed.stat()
+        database.connection.execute(
+            "UPDATE assets SET analysis_status='running' WHERE filename='stale.jpg'"
+        )
+        database.connection.execute(
+            """UPDATE assets SET analysis_status='completed',analyzed_size_bytes=?,
+               analyzed_mtime_ns=? WHERE filename='completed.jpg'""",
+            (completed_stat.st_size, completed_stat.st_mtime_ns),
+        )
+        database.connection.commit()
+        successful = AnalyzerResult("completed", MediaMetadata(width=4, height=5))
+        with patch.object(ImageAnalyzer, "analyze", return_value=successful) as analyze:
+            assert AnalysisEngine(database).run() == 0
+
+        assert analyze.call_count == 1
+        assert analyze.call_args.args == (stale,)
+        statuses = database.connection.execute(
+            "SELECT filename,analysis_status FROM assets ORDER BY filename"
+        ).fetchall()
+        assert [tuple(row) for row in statuses] == [
+            ("completed.jpg", "completed"),
+            ("stale.jpg", "completed"),
+        ]
+        run = database.connection.execute(
+            "SELECT analyzed_files,reused_files,status FROM analysis_runs"
+        ).fetchone()
+        assert tuple(run) == (1, 1, "completed")
 
 
 def test_incremental_analysis_and_reports(tmp_path: Path) -> None:
