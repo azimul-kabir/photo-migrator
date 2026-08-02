@@ -252,7 +252,17 @@ class RelationshipEngine:
                 futures: list[Future[Inspection]] = [
                     executor.submit(_inspect, asset, self.ffprobe) for asset in assets
                 ]
-                inspections = [future.result() for future in futures]
+                inspections = []
+                for asset, future in zip(assets, futures):
+                    try:
+                        inspections.append(future.result())
+                    except Exception as exc:
+                        # A detector is an isolation boundary: preserve the other completed
+                        # inspections and persist this asset's unexpected failure.
+                        error = f"unexpected inspection failure: {type(exc).__name__}: {exc}"
+                        inspections.append(
+                            Inspection(asset, AppleIdentifier(error=error), MotionDetection())
+                        )
             results = build_relationships(inspections)
             failures = sum(1 for item in inspections if item.apple.error or item.motion.error)
             created, reused = self._store(inspections, results)
@@ -318,88 +328,111 @@ class RelationshipEngine:
         created = reused = 0
         keep: set[int] = set()
         now = utc_now()
-        with self.database.transaction() as connection:
-            for result in results:
-                existing = connection.execute(
-                    """SELECT id FROM asset_relationships WHERE relationship_type=?
-                    AND primary_asset_id=? AND secondary_asset_id IS ? AND status=?
-                    AND evidence=?""",
-                    (
-                        result.relationship_type,
-                        result.primary_asset_id,
-                        result.secondary_asset_id,
-                        result.status,
-                        result.evidence,
-                    ),
-                ).fetchone()
-                if existing:
-                    keep.add(int(existing["id"]))
-                    reused += 1
-                    connection.execute(
-                        "UPDATE asset_relationships SET updated_at=? WHERE id=?",
-                        (now, existing["id"]),
-                    )
-                else:
-                    cursor = connection.execute(
-                        """INSERT INTO asset_relationships(relationship_type,primary_asset_id,
-                        secondary_asset_id,confidence,evidence,status,created_at,updated_at)
-                        VALUES (?,?,?,?,?,?,?,?)""",
+        connection = self.database.connection
+        try:
+            with self.database.transaction() as connection:
+                # Connection-local staging avoids SQLite's host-parameter limit. Recreate the
+                # tables on every call so an interrupted prior invocation cannot leak state.
+                connection.execute("DROP TABLE IF EXISTS temp.relationship_inspected_ids")
+                connection.execute("DROP TABLE IF EXISTS temp.relationship_retained_ids")
+                connection.execute(
+                    "CREATE TEMP TABLE relationship_inspected_ids (id INTEGER PRIMARY KEY)"
+                )
+                connection.execute(
+                    "CREATE TEMP TABLE relationship_retained_ids (id INTEGER PRIMARY KEY)"
+                )
+                connection.executemany(
+                    "INSERT INTO relationship_inspected_ids(id) VALUES (?)",
+                    ((asset_id,) for asset_id in sorted(ids)),
+                )
+                for result in results:
+                    existing = connection.execute(
+                        """SELECT id FROM asset_relationships WHERE relationship_type=?
+                        AND primary_asset_id=? AND secondary_asset_id IS ? AND status=?
+                        AND evidence=?""",
                         (
                             result.relationship_type,
                             result.primary_asset_id,
                             result.secondary_asset_id,
-                            result.confidence,
-                            result.evidence,
                             result.status,
-                            now,
-                            now,
+                            result.evidence,
                         ),
-                    )
-                    assert cursor.lastrowid is not None
-                    keep.add(int(cursor.lastrowid))
-                    created += 1
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                stale_sql = (
-                    f"DELETE FROM asset_relationships WHERE primary_asset_id IN ({placeholders})"
-                )
-                parameters: list[object] = list(sorted(ids))
-                if keep:
-                    stale_sql += " AND id NOT IN (" + ",".join("?" for _ in keep) + ")"
-                    parameters.extend(sorted(keep))
-                connection.execute(stale_sql, parameters)
-            by_id = {item.asset.asset_id: item for item in inspections}
-            result_by_id = {item.primary_asset_id: item for item in results}
-            for asset_id, inspection in by_id.items():
-                asset_result = result_by_id.get(asset_id)
-                error = (
-                    inspection.apple.error
-                    or inspection.motion.error
-                    or (asset_result.error if asset_result else None)
-                )
-                state = (
-                    "failed"
-                    if error and asset_result is None
-                    else (
-                        "invalid"
-                        if asset_result and asset_result.status == "invalid"
-                        else "completed"
-                    )
+                    ).fetchone()
+                    if existing:
+                        keep.add(int(existing["id"]))
+                        reused += 1
+                        connection.execute(
+                            "UPDATE asset_relationships SET updated_at=? WHERE id=?",
+                            (now, existing["id"]),
+                        )
+                    else:
+                        cursor = connection.execute(
+                            """INSERT INTO asset_relationships(relationship_type,primary_asset_id,
+                            secondary_asset_id,confidence,evidence,status,created_at,updated_at)
+                            VALUES (?,?,?,?,?,?,?,?)""",
+                            (
+                                result.relationship_type,
+                                result.primary_asset_id,
+                                result.secondary_asset_id,
+                                result.confidence,
+                                result.evidence,
+                                result.status,
+                                now,
+                                now,
+                            ),
+                        )
+                        assert cursor.lastrowid is not None
+                        keep.add(int(cursor.lastrowid))
+                        created += 1
+                connection.executemany(
+                    "INSERT INTO relationship_retained_ids(id) VALUES (?)",
+                    ((relationship_id,) for relationship_id in sorted(keep)),
                 )
                 connection.execute(
-                    """UPDATE assets SET apple_content_identifier=?,motion_photo_offset=?,
-                    relationship_status=?,relationship_error=?,relationship_analyzed_size_bytes=?,
-                    relationship_analyzed_mtime_ns=? WHERE id=?""",
-                    (
-                        inspection.apple.value,
-                        inspection.motion.offset,
-                        state,
-                        error,
-                        inspection.asset.size_bytes,
-                        inspection.asset.mtime_ns,
-                        asset_id,
-                    ),
+                    """DELETE FROM asset_relationships AS relationship
+                    WHERE EXISTS (SELECT 1 FROM relationship_inspected_ids AS inspected
+                                  WHERE inspected.id=relationship.primary_asset_id)
+                    AND NOT EXISTS (SELECT 1 FROM relationship_retained_ids AS retained
+                                    WHERE retained.id=relationship.id)"""
                 )
+                by_id = {item.asset.asset_id: item for item in inspections}
+                result_by_id = {item.primary_asset_id: item for item in results}
+                for asset_id, inspection in by_id.items():
+                    asset_result = result_by_id.get(asset_id)
+                    error = (
+                        inspection.apple.error
+                        or inspection.motion.error
+                        or (asset_result.error if asset_result else None)
+                    )
+                    state = (
+                        "failed"
+                        if error and asset_result is None
+                        else (
+                            "invalid"
+                            if asset_result and asset_result.status == "invalid"
+                            else "completed"
+                        )
+                    )
+                    connection.execute(
+                        """UPDATE assets SET apple_content_identifier=?,motion_photo_offset=?,
+                        relationship_status=?,relationship_error=?,relationship_analyzed_size_bytes=?,
+                        relationship_analyzed_mtime_ns=? WHERE id=?""",
+                        (
+                            inspection.apple.value,
+                            inspection.motion.offset,
+                            state,
+                            error,
+                            inspection.asset.size_bytes,
+                            inspection.asset.mtime_ns,
+                            asset_id,
+                        ),
+                    )
+                connection.execute("DROP TABLE relationship_inspected_ids")
+                connection.execute("DROP TABLE relationship_retained_ids")
+        finally:
+            # Rollback can restore TEMP tables that were present when the transaction began.
+            connection.execute("DROP TABLE IF EXISTS temp.relationship_inspected_ids")
+            connection.execute("DROP TABLE IF EXISTS temp.relationship_retained_ids")
         return created, reused
 
     def _finish(

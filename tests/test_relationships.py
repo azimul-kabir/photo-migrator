@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from photo_migrator.apple_live_photos import AppleIdentifier, normalize_stem
+from photo_migrator.database import Database, utc_now
 from photo_migrator.motion_photos import MotionDetection, inspect_motion_photo
-from photo_migrator.relationships import AssetIdentity, Inspection, build_relationships
+from photo_migrator.relationships import (
+    AssetIdentity,
+    Inspection,
+    RelationshipEngine,
+    RelationshipResult,
+    build_relationships,
+)
 
 
 def asset(asset_id: int, path: Path, source: str = "phone") -> AssetIdentity:
@@ -62,3 +72,123 @@ def test_samsung_marker_is_self_contained(tmp_path: Path) -> None:
     path.write_bytes(b"jpeg MotionPhoto_Data" + b"mp4")
     detection = inspect_motion_photo(path, path.stat().st_size)
     assert (detection.kind, detection.status) == ("samsung", "active")
+
+
+def _insert_assets(database: Database, paths: list[Path]) -> None:
+    now = utc_now()
+    database.connection.executemany(
+        """INSERT INTO assets(source_name,source_priority,absolute_path,relative_path,filename,
+        extension,size_bytes,mtime_ns,media_type,scan_status,first_seen_at,last_seen_at,
+        created_at,updated_at) VALUES ('source',1,?,?,?,?,1,1,'image','available',?,?,?,?)""",
+        ((str(path), path.name, path.name, ".jpg", now, now, now, now) for path in paths),
+    )
+    database.connection.commit()
+
+
+def test_large_relationship_store_preserves_retained_and_deletes_stale(tmp_path: Path) -> None:
+    paths = [tmp_path / f"asset-{index}.jpg" for index in range(1_205)]
+    with Database(tmp_path / "inventory.db") as database:
+        database.initialize()
+        _insert_assets(database, paths)
+        rows = database.connection.execute(
+            "SELECT id,absolute_path FROM assets ORDER BY id"
+        ).fetchall()
+        inspections = [
+            Inspection(
+                asset(row["id"], Path(row["absolute_path"])), AppleIdentifier(), MotionDetection()
+            )
+            for row in rows
+        ]
+        now = utc_now()
+        database.connection.executemany(
+            """INSERT INTO asset_relationships(relationship_type,primary_asset_id,
+            secondary_asset_id,confidence,evidence,status,created_at,updated_at)
+            VALUES ('orphan_motion_image',?,NULL,0.9,?,'orphan',?,?)""",
+            ((row["id"], f"keep-{row['id']}", now, now) for row in rows[:-1]),
+        )
+        stale_id = database.connection.execute(
+            """INSERT INTO asset_relationships(relationship_type,primary_asset_id,
+            secondary_asset_id,confidence,evidence,status,created_at,updated_at)
+            VALUES ('orphan_motion_image',?,NULL,0.9,'stale','orphan',?,?) RETURNING id""",
+            (rows[-1]["id"], now, now),
+        ).fetchone()[0]
+        database.connection.commit()
+        results = [
+            RelationshipResult(
+                "orphan", "orphan_motion_image", row["id"], None, 0.9, f"keep-{row['id']}"
+            )
+            for row in rows[:-1]
+        ]
+        results.append(
+            RelationshipResult("orphan", "orphan_motion_image", rows[-1]["id"], None, 0.9, "new")
+        )
+
+        assert RelationshipEngine(database)._store(inspections, results) == (1, 1_204)
+        stored = database.connection.execute(
+            "SELECT id,evidence FROM asset_relationships ORDER BY id"
+        ).fetchall()
+        assert stale_id not in {row["id"] for row in stored}
+        assert "new" in {row["evidence"] for row in stored}
+        assert not database.connection.execute(
+            "SELECT name FROM sqlite_temp_master WHERE name LIKE 'relationship_%_ids'"
+        ).fetchall()
+        assert all(not path.exists() for path in paths)
+
+
+def test_relationship_store_rolls_back_and_cleans_temp_tables(tmp_path: Path) -> None:
+    path = tmp_path / "source.jpg"
+    with Database(tmp_path / "inventory.db") as database:
+        database.initialize()
+        _insert_assets(database, [path])
+        row = database.connection.execute("SELECT id,absolute_path FROM assets").fetchone()
+        inspection = Inspection(
+            asset(row["id"], Path(row["absolute_path"])), AppleIdentifier(), MotionDetection()
+        )
+        database.connection.execute(
+            """CREATE TRIGGER force_relationship_failure BEFORE UPDATE ON assets
+            BEGIN SELECT RAISE(ABORT, 'forced failure'); END"""
+        )
+        with pytest.raises(Exception, match="forced failure"):
+            RelationshipEngine(database)._store(
+                [inspection],
+                [RelationshipResult("orphan", "orphan_motion_image", row["id"], None, 0.9, "new")],
+            )
+        assert (
+            database.connection.execute("SELECT COUNT(*) FROM asset_relationships").fetchone()[0]
+            == 0
+        )
+        assert not database.connection.execute(
+            "SELECT name FROM sqlite_temp_master WHERE name LIKE 'relationship_%_ids'"
+        ).fetchall()
+        assert not path.exists()
+
+
+def test_unexpected_worker_failure_is_persisted_per_asset(tmp_path: Path) -> None:
+    paths = [tmp_path / "bad.jpg", tmp_path / "good.jpg"]
+    for path in paths:
+        path.write_bytes(b"synthetic")
+    before = [path.read_bytes() for path in paths]
+    with Database(tmp_path / "inventory.db") as database:
+        database.initialize()
+        _insert_assets(database, paths)
+
+        def inspect_one(identity: AssetIdentity, _ffprobe: str) -> Inspection:
+            if identity.filename == "bad.jpg":
+                raise RuntimeError("detector crashed")
+            return Inspection(identity, AppleIdentifier(), MotionDetection())
+
+        with patch("photo_migrator.relationships._inspect", side_effect=inspect_one):
+            assert RelationshipEngine(database, workers=2).run() == 2
+        statuses = database.connection.execute(
+            "SELECT filename,relationship_status,relationship_error FROM assets ORDER BY filename"
+        ).fetchall()
+        assert statuses[0][1] == "failed"
+        assert "detector crashed" in statuses[0][2]
+        assert statuses[1][1] == "completed"
+        assert (
+            database.connection.execute(
+                "SELECT status FROM relationship_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+            == "completed_with_errors"
+        )
+    assert [path.read_bytes() for path in paths] == before
