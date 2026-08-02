@@ -74,25 +74,58 @@ def _inspect(asset: AssetIdentity, ffprobe: str) -> Inspection:
     return Inspection(asset, AppleIdentifier(), MotionDetection())
 
 
-def _timestamp_close(left: str | None, right: str | None) -> bool:
-    if not left or not right:
-        return True
+def _parse_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
     try:
-        first = datetime.fromisoformat(left.replace("Z", "+00:00"))
-        second = datetime.fromisoformat(right.replace("Z", "+00:00"))
-        return abs((first - second).total_seconds()) <= TIMESTAMP_TOLERANCE_SECONDS
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (ValueError, TypeError):
-        return False
+        return None
+
+
+def _timestamp_classification(left: str | None, right: str | None) -> str:
+    """Classify capture times without ever subtracting naive and aware datetimes."""
+    first = _parse_timestamp(left)
+    second = _parse_timestamp(right)
+    if first is None or second is None:
+        return "unavailable"
+
+    first_aware = first.utcoffset() is not None
+    second_aware = second.utcoffset() is not None
+    if first_aware == second_aware and (
+        abs((first - second).total_seconds()) <= TIMESTAMP_TOLERANCE_SECONDS
+    ):
+        return "exact_within_3_seconds"
+
+    # Comparing the displayed fields is safe for a local EXIF time and an aware QuickTime
+    # time.  It also recognizes exports that retained the wall clock but lost the zone.
+    first_wall = first.replace(tzinfo=None)
+    second_wall = second.replace(tzinfo=None)
+    wall_delta = abs((first_wall - second_wall).total_seconds())
+    if wall_delta <= TIMESTAMP_TOLERANCE_SECONDS:
+        return "same_wall_clock_within_3_seconds"
+
+    # Civil offsets in the IANA database are bounded by 14 hours and use 15-minute
+    # increments today.  Allow a three-second metadata rounding tolerance around those
+    # offsets, but only when one timestamp lacks the zone needed for an exact comparison.
+    if first_aware != second_aware and wall_delta <= 14 * 60 * 60:
+        nearest_quarter_hour = round(wall_delta / (15 * 60)) * 15 * 60
+        if nearest_quarter_hour and abs(wall_delta - nearest_quarter_hour) <= 3:
+            return "timezone_offset_compatible"
+    return "incompatible"
+
+
+def _timestamp_close(left: str | None, right: str | None) -> bool:
+    classification = _timestamp_classification(left, right)
+    return classification in {
+        "exact_within_3_seconds",
+        "same_wall_clock_within_3_seconds",
+        "unavailable",
+    }
 
 
 def _nearby(left: Path, right: Path) -> bool:
     return left.parent == right.parent or left.parent.parent == right.parent.parent
-
-
-def _timestamp_evidence(left: str | None, right: str | None) -> str:
-    if not left or not right:
-        return "unavailable_allowed"
-    return "within_3_seconds" if _timestamp_close(left, right) else "outside_3_seconds"
 
 
 def build_relationships(inspections: list[Inspection]) -> list[RelationshipResult]:
@@ -175,11 +208,7 @@ def build_relationships(inspections: list[Inspection]) -> list[RelationshipResul
             continue
         stem = normalize_stem(video.asset.absolute_path.stem)
         image_key = (video.asset.source_name, video.asset.absolute_path.parent, stem)
-        candidates = [
-            image
-            for image in image_locations.get(image_key, ())
-            if _timestamp_close(image.asset.captured_at, video.asset.captured_at)
-        ]
+        candidates = list(image_locations.get(image_key, ()))
         evidence = (
             "fallback=one_sided_apple_identifier;"
             f"video_identifier={video.apple.value};normalized_stem={stem};"
@@ -187,23 +216,49 @@ def build_relationships(inspections: list[Inspection]) -> list[RelationshipResul
         )
         if len(candidates) == 1:
             image = candidates[0]
+            timestamp_classification = _timestamp_classification(
+                image.asset.captured_at, video.asset.captured_at
+            )
+            timestamp_evidence = (
+                f"image_timestamp={image.asset.captured_at or 'unavailable'};"
+                f"video_timestamp={video.asset.captured_at or 'unavailable'};"
+                f"timestamp_classification={timestamp_classification};"
+            )
+            if timestamp_classification == "incompatible":
+                results.append(
+                    RelationshipResult(
+                        "ambiguous",
+                        "apple_live_photo",
+                        video.asset.asset_id,
+                        None,
+                        0.85,
+                        evidence
+                        + timestamp_evidence
+                        + f"candidate_asset_ids={image.asset.asset_id};"
+                        f"candidate_paths={image.asset.absolute_path}",
+                    )
+                )
+                paired.add(video.asset.asset_id)
+                continue
             results.append(
                 RelationshipResult(
                     "active",
                     "apple_live_photo",
                     image.asset.asset_id,
                     video.asset.asset_id,
-                    0.9,
+                    0.85 if timestamp_classification == "unavailable" else 0.9,
                     evidence
-                    + "timestamp_result="
-                    + _timestamp_evidence(image.asset.captured_at, video.asset.captured_at)
-                    + f";image_metadata_source={image.apple.source or 'unavailable'}",
+                    + timestamp_evidence
+                    + f"image_metadata_source={image.apple.source or 'unavailable'}",
                 )
             )
             paired.update((image.asset.asset_id, video.asset.asset_id))
         elif len(candidates) > 1:
             ids = ",".join(str(item.asset.asset_id) for item in candidates)
             paths = "|".join(str(item.asset.absolute_path) for item in candidates)
+            image_timestamps = "|".join(
+                item.asset.captured_at or "unavailable" for item in candidates
+            )
             results.append(
                 RelationshipResult(
                     "ambiguous",
@@ -211,7 +266,9 @@ def build_relationships(inspections: list[Inspection]) -> list[RelationshipResul
                     video.asset.asset_id,
                     None,
                     0.9,
-                    evidence + "timestamp_result=within_3_seconds_or_unavailable;"
+                    evidence + f"image_timestamp={image_timestamps};"
+                    f"video_timestamp={video.asset.captured_at or 'unavailable'};"
+                    "timestamp_classification=unavailable;"
                     f"candidate_asset_ids={ids};candidate_paths={paths}",
                 )
             )
@@ -557,18 +614,16 @@ class RelationshipEngine:
         atomic_write_csv(
             directory / "asset_relationships.csv",
             (
-                tuple(
-                    row[key]
-                    for key in (
-                        "relationship_type",
-                        "status",
-                        "confidence",
-                        "primary_asset_id",
-                        "primary_path",
-                        "secondary_asset_id",
-                        "secondary_path",
-                        "evidence",
-                    )
+                (
+                    row["relationship_type"],
+                    row["status"],
+                    row["confidence"],
+                    row["primary_asset_id"],
+                    row["primary_path"],
+                    row["secondary_asset_id"],
+                    row["secondary_path"],
+                    _evidence_value(row["evidence"], "timestamp_classification"),
+                    row["evidence"],
                 )
                 for row in rows
             ),
@@ -580,6 +635,7 @@ class RelationshipEngine:
                 "primary_path",
                 "secondary_asset_id",
                 "secondary_path",
+                "timestamp_classification",
                 "evidence",
             ),
         )
@@ -616,6 +672,7 @@ class RelationshipEngine:
                         row["primary_path"],
                         _evidence_value(evidence, "candidate_asset_ids"),
                         _evidence_value(evidence, "candidate_paths"),
+                        _evidence_value(evidence, "timestamp_classification"),
                         evidence,
                     )
                 )
@@ -627,6 +684,7 @@ class RelationshipEngine:
                 "primary_path",
                 "candidate_asset_ids",
                 "candidate_paths",
+                "timestamp_classification",
                 "evidence",
             ),
         )
