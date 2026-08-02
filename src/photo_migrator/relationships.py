@@ -89,6 +89,12 @@ def _nearby(left: Path, right: Path) -> bool:
     return left.parent == right.parent or left.parent.parent == right.parent.parent
 
 
+def _timestamp_evidence(left: str | None, right: str | None) -> str:
+    if not left or not right:
+        return "unavailable_allowed"
+    return "within_3_seconds" if _timestamp_close(left, right) else "outside_3_seconds"
+
+
 def build_relationships(inspections: list[Inspection]) -> list[RelationshipResult]:
     """Build normalized results without side effects; output is deterministically sorted."""
     images = [item for item in inspections if item.asset.extension in IMAGE_EXTENSIONS]
@@ -149,13 +155,81 @@ def build_relationships(inspections: list[Inspection]) -> list[RelationshipResul
                     f"identifier_match;candidate_asset_ids={ids};candidate_paths={paths}",
                 )
             )
+            paired.add(image.asset.asset_id)
+            paired.update(match.asset.asset_id for match in matches)
 
+    # An exported image can lose its Apple identifier while its MOV retains one.  Restrict
+    # this recovery to a unique image in the exact directory; common IMG_#### names are not
+    # globally unique across a library.
+    image_locations: dict[tuple[str, Path, str], list[Inspection]] = {}
+    for image in images:
+        if image.asset.asset_id not in paired and not image.apple.value:
+            image_key = (
+                image.asset.source_name,
+                image.asset.absolute_path.parent,
+                normalize_stem(image.asset.absolute_path.stem),
+            )
+            image_locations.setdefault(image_key, []).append(image)
+    for video in videos:
+        if video.asset.asset_id in paired or not video.apple.value:
+            continue
+        stem = normalize_stem(video.asset.absolute_path.stem)
+        image_key = (video.asset.source_name, video.asset.absolute_path.parent, stem)
+        candidates = [
+            image
+            for image in image_locations.get(image_key, ())
+            if _timestamp_close(image.asset.captured_at, video.asset.captured_at)
+        ]
+        evidence = (
+            "fallback=one_sided_apple_identifier;"
+            f"video_identifier={video.apple.value};normalized_stem={stem};"
+            "same_source=true;same_directory=true;"
+        )
+        if len(candidates) == 1:
+            image = candidates[0]
+            results.append(
+                RelationshipResult(
+                    "active",
+                    "apple_live_photo",
+                    image.asset.asset_id,
+                    video.asset.asset_id,
+                    0.9,
+                    evidence
+                    + "timestamp_result="
+                    + _timestamp_evidence(image.asset.captured_at, video.asset.captured_at)
+                    + f";image_metadata_source={image.apple.source or 'unavailable'}",
+                )
+            )
+            paired.update((image.asset.asset_id, video.asset.asset_id))
+        elif len(candidates) > 1:
+            ids = ",".join(str(item.asset.asset_id) for item in candidates)
+            paths = "|".join(str(item.asset.absolute_path) for item in candidates)
+            results.append(
+                RelationshipResult(
+                    "ambiguous",
+                    "apple_live_photo",
+                    video.asset.asset_id,
+                    None,
+                    0.9,
+                    evidence + "timestamp_result=within_3_seconds_or_unavailable;"
+                    f"candidate_asset_ids={ids};candidate_paths={paths}",
+                )
+            )
+            paired.add(video.asset.asset_id)
+
+    video_locations: dict[tuple[str, str], list[Inspection]] = {}
+    for video in videos:
+        if video.asset.asset_id not in paired and not video.apple.value:
+            video_key = (video.asset.source_name, normalize_stem(video.asset.absolute_path.stem))
+            video_locations.setdefault(video_key, []).append(video)
     for image in images:
         if image.asset.asset_id in paired or image.apple.value:
             continue
         candidates = [
             video
-            for video in videos
+            for video in video_locations.get(
+                (image.asset.source_name, normalize_stem(image.asset.absolute_path.stem)), ()
+            )
             if video.asset.asset_id not in paired
             and not video.apple.value
             and video.asset.source_name == image.asset.source_name
@@ -562,6 +636,8 @@ class RelationshipEngine:
             ("Candidate asset count", latest["candidate_assets"] if latest else 0),
             ("Active relationship count", stats["relationships_active"]),
             ("Apple Live Photo count", stats["apple_live_photos"]),
+            ("Exact Apple identifier pair count", stats["apple_live_photos_exact"]),
+            ("One-sided Apple identifier fallback count", stats["apple_live_photos_one_sided"]),
             ("Google Motion Photo count", stats["google_motion_photos"]),
             ("Samsung Motion Photo count", stats["samsung_motion_photos"]),
             ("Filename fallback pair count", stats["filename_pairs"]),

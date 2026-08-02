@@ -443,6 +443,10 @@ class Database:
             """SELECT
             SUM(status='active') active,
             SUM(relationship_type='apple_live_photo' AND status='active') apple,
+            SUM(relationship_type='apple_live_photo' AND status='active' AND confidence=1.0)
+                apple_exact,
+            SUM(relationship_type='apple_live_photo' AND status='active' AND
+                evidence LIKE 'fallback=one_sided_apple_identifier;%') apple_one_sided,
             SUM(relationship_type='google_motion_photo' AND status='active') google,
             SUM(relationship_type='samsung_motion_photo' AND status='active') samsung,
             SUM(relationship_type='filename_pair' AND status='active') filename,
@@ -495,6 +499,8 @@ class Database:
             "latest_analysis_run": latest_analysis,
             "relationships_active": relationship_counts["active"] or 0,
             "apple_live_photos": relationship_counts["apple"] or 0,
+            "apple_live_photos_exact": relationship_counts["apple_exact"] or 0,
+            "apple_live_photos_one_sided": relationship_counts["apple_one_sided"] or 0,
             "google_motion_photos": relationship_counts["google"] or 0,
             "samsung_motion_photos": relationship_counts["samsung"] or 0,
             "filename_pairs": relationship_counts["filename"] or 0,
