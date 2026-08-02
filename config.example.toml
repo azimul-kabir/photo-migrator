@@ -19,3 +19,23 @@ exclude_directory_names = [
 ]
 exclude_filename_suffixes = ["@SynoEAStream"]
 exclude_filename_prefixes = ["SYNOINDEX_"]
+
+[planning]
+destination_root = "/volume1/photo/CleanLibrary"
+date_fallback = "undated"
+naming_template = "{year}/{year}-{month}/{timestamp}_{original_name}"
+preserve_source_subdirectories = false
+case_insensitive_destination = true
+max_filename_length = 180
+
+[planning.keeper_preferences]
+prefer_higher_source_priority = true
+prefer_human_readable_filename = true
+prefer_non_uuid_filename = true
+prefer_shorter_relative_path = true
+prefer_complete_metadata = true
+prefer_relationship_complete_asset = true
+
+[planning.source_overrides]
+MobileBackup = 100
+Originals = 80

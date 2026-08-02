@@ -11,6 +11,7 @@ from photo_migrator.analysis import AnalysisEngine
 from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
 from photo_migrator.hashing import HashEngine
+from photo_migrator.planner import Planner
 from photo_migrator.relationships import RelationshipEngine
 from photo_migrator.scanner import Scanner
 
@@ -47,6 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     relate.add_argument("--resume", action="store_true")
     relate.add_argument("--retry-failed", action="store_true")
     relate.add_argument("--ffprobe", default="ffprobe")
+    plan = subparsers.add_parser("plan", help="create a read-only migration plan")
+    plan.add_argument("--database", type=Path, required=True)
+    plan.add_argument("--config", type=Path, required=True)
+    plan.add_argument("--source")
+    plan.add_argument("--limit", type=int)
+    plan.add_argument("--supersede-draft", action="store_true")
+    plan.add_argument("--include-orphans", action="store_true")
+    plan.add_argument("--minimum-fallback-confidence", type=float, default=0.75)
     return parser
 
 
@@ -86,6 +95,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return RelationshipEngine(database, args.workers, args.ffprobe).run(
                     args.limit, args.source, args.resume, args.retry_failed
                 )
+        if args.command == "plan":
+            config = load_config(args.config)
+            with Database(args.database) as database:
+                database.initialize()
+                plan_result = Planner(database, config).run(
+                    args.source,
+                    args.limit,
+                    args.supersede_draft,
+                    args.include_orphans,
+                    args.minimum_fallback_confidence,
+                )
+            print(
+                f"Plan {plan_result.plan_id}: status={plan_result.status} "
+                f"candidates={plan_result.candidates} items={plan_result.items} "
+                f"collisions={plan_result.collisions} blocked={plan_result.blocked}"
+            )
+            return 0 if plan_result.status != "blocked" else 2
         with Database(args.database) as database:
             database.initialize()
             stats = database.stats()
@@ -128,6 +154,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             "Latest relationship-run status: "
             f"{latest_relationship['status'] if latest_relationship else 'none'}"
         )
+        latest_plan = stats["latest_plan"]
+        counts = stats["latest_plan_counts"]
+        print(f"Latest plan ID: {latest_plan['id'] if latest_plan else 'none'}")
+        print(f"Latest plan status: {latest_plan['status'] if latest_plan else 'none'}")
+        print(
+            "Latest plan candidate assets: "
+            f"{latest_plan['source_asset_count'] if latest_plan else 0}"
+        )
+        for label, key in (
+            ("keep actions", "keep_count"),
+            ("duplicate skips", "duplicate_skips"),
+            ("relationship members", "relationship_members"),
+            ("review items", "review_items"),
+            ("blocked items", "blocked_items"),
+            ("collisions", "collisions"),
+        ):
+            print(f"Latest plan {label}: {counts[key] or 0 if counts else 0}")
         return 0
     except (ConfigError, OSError, ValueError) as exc:
         logging.error("%s", exc)

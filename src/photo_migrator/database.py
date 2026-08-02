@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def utc_now() -> str:
@@ -154,6 +154,42 @@ class Database:
                     failed_count INTEGER NOT NULL DEFAULT 0,
                     message TEXT
                 );
+                CREATE TABLE IF NOT EXISTS planning_runs (
+                    id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
+                    status TEXT NOT NULL CHECK(status IN ('running','completed','completed_with_errors','failed')),
+                    candidate_assets INTEGER NOT NULL DEFAULT 0,
+                    exact_duplicate_groups INTEGER NOT NULL DEFAULT 0,
+                    bundles_created INTEGER NOT NULL DEFAULT 0, keepers_selected INTEGER NOT NULL DEFAULT 0,
+                    items_planned INTEGER NOT NULL DEFAULT 0, collisions INTEGER NOT NULL DEFAULT 0,
+                    ambiguous_items INTEGER NOT NULL DEFAULT 0, blocked_items INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0, message TEXT
+                );
+                CREATE TABLE IF NOT EXISTS migration_plans (
+                    id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('draft','ready','blocked','superseded')),
+                    destination_root TEXT NOT NULL, naming_template TEXT NOT NULL,
+                    config_snapshot TEXT NOT NULL, fingerprint TEXT NOT NULL,
+                    source_asset_count INTEGER NOT NULL, unique_content_count INTEGER NOT NULL,
+                    duplicate_group_count INTEGER NOT NULL, bundle_count INTEGER NOT NULL,
+                    planned_item_count INTEGER NOT NULL, collision_count INTEGER NOT NULL,
+                    ambiguous_count INTEGER NOT NULL, blocked_count INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS migration_plan_items (
+                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES migration_plans(id),
+                    bundle_key TEXT NOT NULL, primary_asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    action TEXT NOT NULL CHECK(action IN ('keep','skip_exact_duplicate','include_relationship_member','review','blocked')),
+                    status TEXT NOT NULL CHECK(status IN ('planned','collision','ambiguous','blocked','superseded')),
+                    destination_relative_path TEXT,
+                    original_destination_relative_path TEXT, reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    CHECK(destination_relative_path IS NULL OR (destination_relative_path NOT LIKE '/%' AND destination_relative_path NOT LIKE '../%' AND destination_relative_path NOT LIKE '%/../%' AND destination_relative_path != '..'))
+                );
+                CREATE TABLE IF NOT EXISTS migration_plan_item_assets (
+                    plan_item_id INTEGER NOT NULL REFERENCES migration_plan_items(id),
+                    asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    role TEXT NOT NULL CHECK(role IN ('primary','relationship_member','duplicate_skipped')),
+                    PRIMARY KEY(plan_item_id, asset_id, role)
+                );
                 """
             )
             columns = {
@@ -233,6 +269,12 @@ class Database:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_relationship_active_unique
                     ON asset_relationships(relationship_type,primary_asset_id,
                         COALESCE(secondary_asset_id,-1)) WHERE status='active';
+                CREATE INDEX IF NOT EXISTS idx_plan_items_plan ON migration_plan_items(plan_id);
+                CREATE INDEX IF NOT EXISTS idx_plan_items_primary ON migration_plan_items(primary_asset_id);
+                CREATE INDEX IF NOT EXISTS idx_plan_items_status ON migration_plan_items(status);
+                CREATE INDEX IF NOT EXISTS idx_plan_items_action ON migration_plan_items(action);
+                CREATE INDEX IF NOT EXISTS idx_plan_items_destination ON migration_plan_items(destination_relative_path);
+                CREATE INDEX IF NOT EXISTS idx_plan_items_bundle ON migration_plan_items(bundle_key);
                 """
             )
 
@@ -372,6 +414,19 @@ class Database:
             SUM(status='invalid') invalid FROM asset_relationships"""
         ).fetchone()
         assert relationship_counts is not None
+        latest_plan = connection.execute(
+            "SELECT * FROM migration_plans ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        plan_counts = None
+        if latest_plan is not None:
+            plan_counts = connection.execute(
+                """SELECT SUM(action='keep') keep_count,
+                SUM(action='skip_exact_duplicate') duplicate_skips,
+                SUM(action='include_relationship_member') relationship_members,
+                SUM(action='review') review_items, SUM(action='blocked') blocked_items,
+                SUM(status='collision') collisions FROM migration_plan_items WHERE plan_id=?""",
+                (latest_plan["id"],),
+            ).fetchone()
         return {
             "total": scalar["total"],
             "available": scalar["available"] or 0,
@@ -407,4 +462,6 @@ class Database:
             "ambiguous_relationships": relationship_counts["ambiguous"] or 0,
             "invalid_relationships": relationship_counts["invalid"] or 0,
             "latest_relationship_run": latest_relationship,
+            "latest_plan": latest_plan,
+            "latest_plan_counts": plan_counts,
         }

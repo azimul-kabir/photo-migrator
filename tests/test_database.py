@@ -13,6 +13,12 @@ def test_initialize_schema_and_pragmas(tmp_path: Path) -> None:
             )
         }
         assert {"assets", "scan_runs", "schema_version"} <= tables
+        assert {
+            "planning_runs",
+            "migration_plans",
+            "migration_plan_items",
+            "migration_plan_item_assets",
+        } <= tables
         assert database.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert database.connection.execute("SELECT version FROM schema_version").fetchone()[0] == 2
 

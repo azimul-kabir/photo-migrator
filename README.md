@@ -144,3 +144,47 @@ Malformed metadata and offsets are surfaced as errors or invalid records. Separa
 Google/Samsung pairing requires explicit evidence; embedded video is never materialized. Keeper
 selection and migration planning remain unimplemented, as do conversion, perceptual matching,
 HTML output, and Immich integration.
+# Migration planning (Milestone 4)
+
+Create an immutable, reviewable dry-run snapshot after scanning, hashing, metadata analysis,
+and relationship analysis:
+
+```bash
+photo-migrator plan --database photo.db --config config.toml
+photo-migrator plan --database photo.db --config config.toml --source MobileBackup --limit 500
+photo-migrator plan --database photo.db --config config.toml --include-orphans
+```
+
+Planning is a strict safety boundary: **no destination directory is created and no media file
+is copied, linked, moved, renamed, rewritten, or deleted**. The only writes are SQLite planning
+history and deterministic CSV/text files below the database-adjacent `reports/` directory.
+Plan output must be reviewed before a future build milestone.
+
+Exact duplicates are matched by completed SHA-256 only. Within each byte-identical group the
+ordered keeper precedence is relationship completeness, source priority, configured source
+override, human-readable name, non-UUID name, metadata completeness, shorter relative path,
+and finally lexical path (plus asset ID). This makes ties explicit and deterministic.
+
+Active Apple Live Photo image/video pairs are relationship-aware bundles; self-contained Google
+and Samsung Motion Photos remain single-file bundles. Active filename fallback pairs below
+`--minimum-fallback-confidence` and ambiguous or orphan relationships require manual review.
+`--include-orphans` explicitly permits standalone orphan components. Conflicting active bundles
+are blocked.
+
+The `[planning]` configuration selects an absolute, non-overlapping `destination_root`, a naming
+template, `date_fallback`, collision case rules, and a filename limit. Supported fields are
+`year`, `month`, `day`, `hour`, `minute`, `second`, `timestamp`, `original_name`, `stem`,
+`extension`, `source_name`, and `asset_id`. Capture metadata drives date fields; missing or invalid
+dates use the configured undated directory, never filesystem mtime. Unicode is preserved,
+controls and separators are removed, and truncation preserves extensions.
+
+The complete normalized namespace is collision checked (including case and Unicode normalization).
+Collisions receive a deterministic `__a<asset-id>` suffix and are rechecked; unsafe or impossible
+paths are blocked. A plan is `ready` with no review/blocked items, `draft` with review items,
+`blocked` with blocked items, or `superseded` when explicitly replaced with `--supersede-draft`.
+
+Each `reports/plan_<id>/` contains `plan_summary.txt`, `keeper_decisions.csv`,
+`migration_plan.csv`, `duplicate_skips.csv`, `relationship_bundles.csv`, `collisions.csv`,
+`review_items.csv`, and `blocked_items.csv`. Reports include source paths solely for auditability.
+Current limitations are planning-only: no build, conversion, EXIF writing, embedded-video
+extraction, perceptual matching, HTML, or Immich integration is performed.
