@@ -31,9 +31,117 @@ class ScanConfig:
 
 
 @dataclass(frozen=True)
+class KeeperPreferences:
+    prefer_higher_source_priority: bool = True
+    prefer_human_readable_filename: bool = True
+    prefer_non_uuid_filename: bool = True
+    prefer_shorter_relative_path: bool = True
+    prefer_complete_metadata: bool = True
+    prefer_relationship_complete_asset: bool = True
+
+
+@dataclass(frozen=True)
+class PlanningConfig:
+    destination_root: Path
+    date_fallback: str
+    naming_template: str
+    preserve_source_subdirectories: bool
+    case_insensitive_destination: bool
+    max_filename_length: int
+    keeper_preferences: KeeperPreferences
+    source_overrides: tuple[tuple[str, int], ...]
+
+
+@dataclass(frozen=True)
 class Config:
     sources: tuple[SourceConfig, ...]
     scan: ScanConfig
+    planning: PlanningConfig | None = None
+
+
+SUPPORTED_TEMPLATE_FIELDS = frozenset(
+    {
+        "year",
+        "month",
+        "day",
+        "hour",
+        "minute",
+        "second",
+        "timestamp",
+        "original_name",
+        "stem",
+        "extension",
+        "source_name",
+        "asset_id",
+    }
+)
+
+
+def _planning(raw: Any, sources: list[SourceConfig]) -> PlanningConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ConfigError("planning must be a table")
+    destination_value = raw.get("destination_root")
+    if (
+        not isinstance(destination_value, str)
+        or not Path(destination_value).expanduser().is_absolute()
+    ):
+        raise ConfigError("planning.destination_root must be absolute")
+    destination = Path(destination_value).expanduser().resolve(strict=False)
+    for source in sources:
+        if destination == source.path or destination.is_relative_to(source.path):
+            raise ConfigError("destination_root must not equal or be inside a source root")
+        if source.path.is_relative_to(destination):
+            raise ConfigError("source root must not be inside destination_root")
+    template = raw.get("naming_template", "{year}/{year}-{month}/{timestamp}_{original_name}")
+    if not isinstance(template, str) or not template:
+        raise ConfigError("planning.naming_template must be a non-empty string")
+    import string
+
+    try:
+        fields = {name for _, name, _, _ in string.Formatter().parse(template) if name}
+    except ValueError as exc:
+        raise ConfigError(f"invalid naming template: {exc}") from exc
+    unsupported = fields - SUPPORTED_TEMPLATE_FIELDS
+    if unsupported:
+        raise ConfigError(f"unsupported naming template fields: {', '.join(sorted(unsupported))}")
+    maximum = raw.get("max_filename_length", 180)
+    if not isinstance(maximum, int) or isinstance(maximum, bool) or not 16 <= maximum <= 255:
+        raise ConfigError("planning.max_filename_length must be between 16 and 255")
+    fallback = raw.get("date_fallback", "undated")
+    if (
+        not isinstance(fallback, str)
+        or not fallback.strip()
+        or fallback in {".", ".."}
+        or "/" in fallback
+        or "\\" in fallback
+    ):
+        raise ConfigError("planning.date_fallback must be a safe directory name")
+    preferences_raw = raw.get("keeper_preferences", {})
+    overrides_raw = raw.get("source_overrides", {})
+    if not isinstance(preferences_raw, dict) or not isinstance(overrides_raw, dict):
+        raise ConfigError("planning preference and override values must be tables")
+    for key, value in overrides_raw.items():
+        if not isinstance(key, str) or not isinstance(value, int) or isinstance(value, bool):
+            raise ConfigError("planning.source_overrides must map names to integers")
+    defaults = KeeperPreferences()
+    values: dict[str, bool] = {}
+    for name in defaults.__dataclass_fields__:
+        value = preferences_raw.get(name, getattr(defaults, name))
+        if not isinstance(value, bool):
+            raise ConfigError(f"planning.keeper_preferences.{name} must be boolean")
+        values[name] = value
+    return PlanningConfig(
+        destination,
+        fallback,
+        template,
+        bool(raw.get("preserve_source_subdirectories", False)),
+        bool(raw.get("case_insensitive_destination", True)),
+        maximum,
+        KeeperPreferences(**values),
+        tuple(sorted(overrides_raw.items())),
+    )
 
 
 def _string_list(value: Any, field: str) -> list[str]:
@@ -114,4 +222,5 @@ def load_config(path: Path) -> Config:
                 )
             ),
         ),
+        planning=_planning(raw.get("planning"), sources),
     )
