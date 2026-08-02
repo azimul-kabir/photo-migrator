@@ -139,7 +139,12 @@ ambiguous rather than selected; fallback pairing may require user review. Identi
 unmatched components are reported as orphans, while ordinary standalone videos are not.
 
 Relationship state is stored in SQLite and analysis size/mtime snapshots make results auditable.
-Runs are retained and repeated results are reused without duplicate rows. Deterministic files in
+Runs are retained and repeated results are reused without duplicate rows. Large-library
+persistence stages inspected asset and retained relationship IDs in connection-local SQLite
+temporary tables, so cleanup does not depend on SQLite's host-parameter limit. The staging data
+is recreated for each run and relationship inserts, stale-row cleanup, and asset status updates
+commit atomically. An unexpected detector failure is recorded against that asset while unrelated
+inspections continue; the run then finishes `completed_with_errors`. Deterministic files in
 `reports/` are:
 
 * `relationship_summary.txt` — counts and latest run status;
