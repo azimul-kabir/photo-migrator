@@ -8,12 +8,14 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from photo_migrator.analysis import AnalysisEngine
+from photo_migrator.builder import Builder, Rollback
 from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
 from photo_migrator.hashing import HashEngine
 from photo_migrator.planner import Planner
 from photo_migrator.relationships import RelationshipEngine
 from photo_migrator.scanner import Scanner
+from photo_migrator.verifier import Verifier
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,6 +58,30 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--supersede-draft", action="store_true")
     plan.add_argument("--include-orphans", action="store_true")
     plan.add_argument("--minimum-fallback-confidence", type=float, default=0.75)
+    build = subparsers.add_parser(
+        "build", help="execute a reviewed migration plan (dry-run by default)"
+    )
+    build.add_argument("--database", type=Path, required=True)
+    build.add_argument("--plan-id", type=int, required=True)
+    build.add_argument("--mode", choices=("copy", "hardlink"))
+    build.add_argument("--workers", type=int, default=1)
+    build.add_argument("--allow-draft", action="store_true")
+    build.add_argument("--resume", action="store_true")
+    build.add_argument("--verify-only", action="store_true")
+    build.add_argument("--limit", type=int)
+    verify = subparsers.add_parser("verify", help="verify one build run's recorded destinations")
+    verify.add_argument("--database", type=Path, required=True)
+    verify.add_argument("--build-run-id", type=int, required=True)
+    verify.add_argument("--workers", type=int, default=1)
+    verify.add_argument("--limit", type=int)
+    verify.add_argument("--repair-metadata-only", action="store_true")
+    rollback = subparsers.add_parser(
+        "rollback", help="remove unchanged files owned by one build run"
+    )
+    rollback.add_argument("--database", type=Path, required=True)
+    rollback.add_argument("--build-run-id", type=int, required=True)
+    rollback.add_argument("--dry-run", action="store_true")
+    rollback.add_argument("--confirm-owned-files-only", action="store_true")
     return parser
 
 
@@ -112,6 +138,37 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"collisions={plan_result.collisions} blocked={plan_result.blocked}"
             )
             return 0 if plan_result.status != "blocked" else 2
+        if args.command == "build":
+            with Database(args.database) as database:
+                database.initialize()
+                run_id = Builder(database, args.workers).run(
+                    args.plan_id,
+                    args.mode,
+                    args.allow_draft,
+                    args.resume,
+                    args.verify_only,
+                    args.limit,
+                )
+            print(f"Build run {run_id} complete")
+            return 0
+        if args.command == "verify":
+            with Database(args.database) as database:
+                database.initialize()
+                results = Verifier(database, args.workers).run(
+                    args.build_run_id, args.limit, args.repair_metadata_only
+                )
+            failed = sum(result.status == "verification_failed" for result in results)
+            print(f"Verification complete: checked={len(results)} failed={failed}")
+            return 2 if failed else 0
+        if args.command == "rollback":
+            dry_run = args.dry_run or not args.confirm_owned_files_only
+            with Database(args.database) as database:
+                database.initialize()
+                rollback_results = Rollback(database).run(
+                    args.build_run_id, dry_run, args.confirm_owned_files_only
+                )
+            print(f"Rollback {'dry-run' if dry_run else 'complete'}: items={len(rollback_results)}")
+            return 0
         with Database(args.database) as database:
             database.initialize()
             stats = database.stats()
@@ -171,6 +228,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             ("collisions", "collisions"),
         ):
             print(f"Latest plan {label}: {counts[key] or 0 if counts else 0}")
+        latest_build = stats["latest_build_run"]
+        print(f"Latest build run ID: {latest_build['id'] if latest_build else 'none'}")
+        print(f"Latest build run plan ID: {latest_build['plan_id'] if latest_build else 'none'}")
+        for label, key in (
+            ("mode", "mode"),
+            ("status", "status"),
+            ("completed items", "completed_items"),
+            ("failed items", "failed_items"),
+            ("verified items", "verified_items"),
+            ("verification failures", "verification_failed_items"),
+            ("bytes written", "bytes_written"),
+            ("rollback status", "rollback_status"),
+        ):
+            default = "none" if key in {"mode", "status", "rollback_status"} else 0
+            print(f"Latest build {label}: {latest_build[key] if latest_build else default}")
         return 0
     except (ConfigError, OSError, ValueError) as exc:
         logging.error("%s", exc)
