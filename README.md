@@ -95,9 +95,15 @@ Filesystem modification time is never treated as capture time. EXIF dates withou
 remain naive local ISO-8601 timestamps; the tool does not invent an offset.
 
 Completed results are reused only while indexed and analyzed size and nanosecond modification time
-match. `--resume` retries interrupted `running` records, while `--retry-failed` explicitly retries
-failed and unsupported records. Decoder, file, and ffprobe failures are stored per asset and do not
-stop other assets. SQLite writes are serialized even when `--workers` enables concurrent reads.
+still match the source. Assets left in `running` state by an interrupted process are safely queued
+again on the next analysis run. Pillow's decompression-bomb protection remains enabled: images that
+exceed its safety limit are recorded as per-asset failures, including the reported pixel count and
+safety limit, while unrelated assets continue. Review these entries separately in the metadata
+reports rather than disabling the protection.
+`--resume` may be used to make this recovery intent explicit, while `--retry-failed` explicitly
+retries failed and unsupported records. Decoder, file, and ffprobe failures are stored per asset and
+do not stop other assets. SQLite writes are serialized even when `--workers` enables concurrent
+reads.
 
 Each run writes deterministic `reports/metadata_summary.txt`, `reports/camera_statistics.csv`, and
 `reports/missing_metadata.csv` files. The latter is informational: camera and GPS are not presumed

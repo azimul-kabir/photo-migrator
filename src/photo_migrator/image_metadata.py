@@ -13,12 +13,18 @@ from photo_migrator.metadata import AnalyzerResult, MediaMetadata
 
 Image: Any
 UnidentifiedImageError: Any
+DecompressionBombError: Any
+DecompressionBombWarning: Any
 try:
     Image = importlib.import_module("PIL.Image")
     UnidentifiedImageError = importlib.import_module("PIL").UnidentifiedImageError
+    DecompressionBombError = Image.DecompressionBombError
+    DecompressionBombWarning = Image.DecompressionBombWarning
 except ImportError:
     Image = None
     UnidentifiedImageError = OSError
+    DecompressionBombError = OSError
+    DecompressionBombWarning = Warning
 
 pillow_heif: Any
 try:
@@ -138,6 +144,15 @@ class ImageAnalyzer:
                     altitude=altitude,
                 )
                 return AnalyzerResult("completed", metadata)
+        except (DecompressionBombError, DecompressionBombWarning) as exc:
+            limit = getattr(Image, "MAX_IMAGE_PIXELS", None)
+            return AnalyzerResult(
+                "failed",
+                error=(
+                    f"Pillow image safety limit: {type(exc).__name__}: {exc}; "
+                    f"MAX_IMAGE_PIXELS={limit}"
+                ),
+            )
         except UnidentifiedImageError as exc:
             return AnalyzerResult("failed", error=f"unreadable image: {exc}")
         except (OSError, ValueError, TypeError, SyntaxError) as exc:

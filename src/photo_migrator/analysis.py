@@ -76,13 +76,24 @@ class AnalysisEngine:
         errors: list[str] = []
         try:
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
-                futures: list[Future[AssetAnalysis]] = []
+                futures: list[tuple[AnalysisCandidate, Future[AssetAnalysis]]] = []
                 for candidate in candidates:
                     self._mark_running(candidate.id)
-                    futures.append(executor.submit(_analyze, candidate, self.ffprobe))
+                    futures.append((candidate, executor.submit(_analyze, candidate, self.ffprobe)))
                 # Consume in absolute-path submission order for deterministic persistence.
-                for future in futures:
-                    item = future.result()
+                for candidate, future in futures:
+                    try:
+                        item = future.result()
+                    except Exception as exc:
+                        item = AssetAnalysis(
+                            candidate,
+                            AnalyzerResult(
+                                "failed",
+                                error=f"analysis worker error: {type(exc).__name__}: {exc}",
+                            ),
+                            None,
+                            None,
+                        )
                     self._store(item)
                     if item.result.status == "completed":
                         analyzed += 1
@@ -111,9 +122,10 @@ class AnalysisEngine:
     def _candidates(
         self, limit: int | None, source: str | None, resume: bool, retry_failed: bool
     ) -> list[AnalysisCandidate]:
-        statuses = ["pending"]
-        if resume:
-            statuses.append("running")
+        # A running marker is never a completed result. Reclaim it on every invocation so a
+        # prior process crash cannot strand the asset indefinitely. ``resume`` remains accepted
+        # for CLI compatibility and documents the caller's intent.
+        statuses = ["pending", "running"]
         if retry_failed:
             statuses.extend(("failed", "unsupported"))
         placeholders = ",".join("?" for _ in statuses)
