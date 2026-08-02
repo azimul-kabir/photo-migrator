@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from photo_migrator.apple_live_photos import AppleIdentifier, normalize_stem
+from photo_migrator.apple_live_photos import AppleIdentifier, inspect_image, normalize_stem
 from photo_migrator.database import Database, utc_now
 from photo_migrator.motion_photos import MotionDetection, inspect_motion_photo
 from photo_migrator.relationships import (
@@ -20,6 +20,121 @@ from photo_migrator.relationships import (
 def asset(asset_id: int, path: Path, source: str = "phone") -> AssetIdentity:
     kind = "image" if path.suffix.lower() == ".jpg" else "video"
     return AssetIdentity(asset_id, path, path.name, path.suffix.lower(), kind, None, source, 10, 1)
+
+
+def with_time(identity: AssetIdentity, captured_at: str) -> AssetIdentity:
+    return AssetIdentity(
+        identity.asset_id,
+        identity.absolute_path,
+        identity.filename,
+        identity.extension,
+        identity.media_type,
+        captured_at,
+        identity.source_name,
+        identity.size_bytes,
+        identity.mtime_ns,
+    )
+
+
+def test_one_sided_apple_identifier_pairs_same_directory_heic(tmp_path: Path) -> None:
+    image = Inspection(asset(1, tmp_path / "IMG_1327.HEIC"), AppleIdentifier(), MotionDetection())
+    video = Inspection(
+        asset(2, tmp_path / "IMG_1327.MOV"),
+        AppleIdentifier("apple-id", "video:test"),
+        MotionDetection(),
+    )
+    result = build_relationships([image, video])
+    assert [(row.status, row.relationship_type, row.confidence) for row in result] == [
+        ("active", "apple_live_photo", 0.9)
+    ]
+    assert "fallback=one_sided_apple_identifier" in result[0].evidence
+    assert "video_identifier=apple-id" in result[0].evidence
+    assert "same_source=true;same_directory=true" in result[0].evidence
+    assert not any(row.relationship_type == "orphan_motion_video" for row in result)
+
+
+def test_one_sided_identifier_never_crosses_directories_or_sources(tmp_path: Path) -> None:
+    video = Inspection(
+        asset(3, tmp_path / "2024" / "IMG_1.mov"),
+        AppleIdentifier("id", "video:test"),
+        MotionDetection(),
+    )
+    images = [
+        Inspection(
+            asset(1, tmp_path / "2023" / "IMG_1.heic"), AppleIdentifier(), MotionDetection()
+        ),
+        Inspection(
+            asset(2, tmp_path / "2024" / "IMG_1.jpg", "other"), AppleIdentifier(), MotionDetection()
+        ),
+    ]
+    result = build_relationships([*images, video])
+    assert [row.relationship_type for row in result] == ["orphan_motion_video"]
+
+
+def test_one_sided_identifier_rejects_timestamp_mismatch(tmp_path: Path) -> None:
+    image = Inspection(
+        with_time(asset(1, tmp_path / "IMG_1.heic"), "2024-01-01T00:00:00"),
+        AppleIdentifier(),
+        MotionDetection(),
+    )
+    video = Inspection(
+        with_time(asset(2, tmp_path / "IMG_1.mov"), "2024-01-01T00:00:04"),
+        AppleIdentifier("id", "video:test"),
+        MotionDetection(),
+    )
+    assert [row.relationship_type for row in build_relationships([image, video])] == [
+        "orphan_motion_video"
+    ]
+
+
+def test_one_sided_identifier_multiple_images_is_ambiguous(tmp_path: Path) -> None:
+    items = [
+        Inspection(asset(1, tmp_path / "IMG_1.heic"), AppleIdentifier(), MotionDetection()),
+        Inspection(asset(2, tmp_path / "IMG_1.jpg"), AppleIdentifier(), MotionDetection()),
+        Inspection(
+            asset(3, tmp_path / "IMG_1.mov"), AppleIdentifier("id", "video:test"), MotionDetection()
+        ),
+    ]
+    result = build_relationships(items)
+    assert len(result) == 1
+    assert (result[0].status, result[0].relationship_type) == ("ambiguous", "apple_live_photo")
+
+
+def test_heif_identifier_uses_metadata_blocks_without_changing_source(tmp_path: Path) -> None:
+    path = tmp_path / "IMG_1.heic"
+    original = b"synthetic unchanged heif"
+    path.write_bytes(original)
+    identifier = b"com.apple.quicktime.content.identifier 6c576f1e-5371-471a-858e-23405c9d8681"
+    fake = type("FakeHeif", (), {"info": {"metadata": [{"type": "XMP", "data": identifier}]}})()
+    with patch("pillow_heif.open_heif", return_value=fake) as opened:
+        result = inspect_image(path)
+    assert result.value == "6c576f1e-5371-471a-858e-23405c9d8681"
+    assert result.source == "image:heif_metadata:xmp:com.apple.quicktime.content.identifier"
+    opened.assert_called_once()
+    assert path.read_bytes() == original
+
+
+def test_relationship_candidate_build_scales_to_thousands(tmp_path: Path) -> None:
+    items = []
+    for index in range(2_500):
+        directory = tmp_path / str(index)
+        items.extend(
+            (
+                Inspection(
+                    asset(index * 2 + 1, directory / "IMG_1.heic"),
+                    AppleIdentifier(),
+                    MotionDetection(),
+                ),
+                Inspection(
+                    asset(index * 2 + 2, directory / "IMG_1.mov"),
+                    AppleIdentifier(f"id-{index}", "video:test"),
+                    MotionDetection(),
+                ),
+            )
+        )
+    result = build_relationships(items)
+    assert len(result) == 2_500
+    assert all(row.relationship_type == "apple_live_photo" for row in result)
 
 
 def test_identifier_pair_precedes_filename_fallback(tmp_path: Path) -> None:

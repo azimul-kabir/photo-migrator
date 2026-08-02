@@ -278,6 +278,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(f"Active relationships: {stats['relationships_active']}")
         print(f"Apple Live Photos: {stats['apple_live_photos']}")
+        print(f"Exact Apple identifier pairs: {stats['apple_live_photos_exact']}")
+        print(f"One-sided Apple identifier fallback pairs: {stats['apple_live_photos_one_sided']}")
         print(f"Google Motion Photos: {stats['google_motion_photos']}")
         print(f"Samsung Motion Photos: {stats['samsung_motion_photos']}")
         print(f"Fallback filename pairs: {stats['filename_pairs']}")

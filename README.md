@@ -131,7 +131,15 @@ content identifiers from image metadata and QuickTime tags. Google Pixel XMP mot
 validated offsets, and explicit Samsung motion-photo markers, identify self-contained Motion
 Photos; the embedded motion video is recorded but **not extracted**.
 
-When identifiers are absent, the engine conservatively considers only supported image/video
+Exact image-to-video Apple identifiers are the highest-confidence pairs. When an identifier-bearing
+video's image identifier is missing (commonly after an export strips image metadata), a distinct
+one-sided Apple fallback requires the same source, exact parent directory, normalized stem, a
+timestamp difference of at most three seconds when both timestamps exist, and exactly one eligible
+image. It is recorded as an `apple_live_photo` at lower confidence than an exact identifier pair but
+higher confidence than a generic filename pair. Multiple eligible images are ambiguous, and reused
+`IMG_####` names in other folders are never considered by this Apple fallback.
+
+When identifiers are absent on both components, the engine conservatively considers only supported image/video
 extensions with the same normalized stem and source, the same or a nearby directory, and capture
 times within three seconds when both exist. Apple's `IMG_E1234` edit name normalizes to
 `IMG_1234`. Conflicting identifiers are never overridden. Equal candidates are reported as
@@ -147,7 +155,8 @@ commit atomically. An unexpected detector failure is recorded against that asset
 inspections continue; the run then finishes `completed_with_errors`. Deterministic files in
 `reports/` are:
 
-* `relationship_summary.txt` — counts and latest run status;
+* `relationship_summary.txt` — separate counts for exact Apple pairs, one-sided Apple fallbacks,
+  generic filename fallbacks, genuine orphans, and the latest run status;
 * `asset_relationships.csv` — normalized relationships and evidence;
 * `orphan_assets.csv` — unmatched supported components and errors;
 * `ambiguous_relationships.csv` — all equally plausible candidates.

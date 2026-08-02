@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
 import subprocess
@@ -16,6 +17,8 @@ IDENTIFIER_KEYS = (
     "asset identifier",
 )
 _UUID = re.compile(rb"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,40}")
+_MAX_METADATA_BLOCKS = 64
+_MAX_METADATA_BLOCK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -30,13 +33,7 @@ def normalize_identifier(value: object) -> str | None:
     return text.casefold() or None
 
 
-def inspect_image(path: Path, maximum_bytes: int = 1024 * 1024) -> AppleIdentifier:
-    """Find common identifier keys without decoding or loading the whole image."""
-    try:
-        with path.open("rb") as stream:
-            data = stream.read(maximum_bytes)
-    except OSError as exc:
-        return AppleIdentifier(error=f"image metadata read failed: {exc}")
+def _identifier_in_bytes(data: bytes, source: str) -> AppleIdentifier | None:
     lowered = data.lower()
     for key in IDENTIFIER_KEYS:
         position = lowered.find(key.encode())
@@ -45,9 +42,51 @@ def inspect_image(path: Path, maximum_bytes: int = 1024 * 1024) -> AppleIdentifi
             if match:
                 return AppleIdentifier(
                     normalize_identifier(match.group().decode("ascii", "replace")),
-                    f"image:{key}",
+                    f"{source}:{key}",
                 )
-    return AppleIdentifier()
+    return None
+
+
+def _inspect_heif_metadata(path: Path) -> AppleIdentifier | None:
+    """Inspect libheif metadata blocks without requesting decoded pixels."""
+    try:
+        pillow_heif = importlib.import_module("pillow_heif")
+    except ImportError:
+        return None
+    try:
+        heif = pillow_heif.open_heif(path, convert_hdr_to_8bit=False)
+        info = getattr(heif, "info", {})
+        blocks = info.get("metadata", ()) if isinstance(info, dict) else ()
+        for index, block in enumerate(blocks):
+            if index >= _MAX_METADATA_BLOCKS or not isinstance(block, dict):
+                break
+            payload = block.get("data")
+            if not isinstance(payload, bytes):
+                continue
+            kind = str(block.get("type") or "unknown").casefold()
+            found = _identifier_in_bytes(
+                payload[:_MAX_METADATA_BLOCK_BYTES], f"image:heif_metadata:{kind}"
+            )
+            if found:
+                return found
+    except (OSError, ValueError, TypeError, SyntaxError):
+        # Metadata extraction is opportunistic; the bounded byte scan remains available.
+        return None
+    return None
+
+
+def inspect_image(path: Path, maximum_bytes: int = 1024 * 1024) -> AppleIdentifier:
+    """Find common identifier keys without decoding or loading the whole image."""
+    if path.suffix.casefold() in {".heic", ".heif"}:
+        identifier = _inspect_heif_metadata(path)
+        if identifier:
+            return identifier
+    try:
+        with path.open("rb") as stream:
+            data = stream.read(maximum_bytes)
+    except OSError as exc:
+        return AppleIdentifier(error=f"image metadata read failed: {exc}")
+    return _identifier_in_bytes(data, "image:bounded_file_metadata") or AppleIdentifier()
 
 
 def inspect_video(path: Path, ffprobe: str, timeout: float = 15.0) -> AppleIdentifier:
