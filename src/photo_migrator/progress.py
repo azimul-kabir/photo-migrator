@@ -22,30 +22,46 @@ def format_bytes(value: int) -> str:
     raise AssertionError("unreachable")
 
 
-def format_duration(seconds: float) -> str:
+def format_duration(seconds: float, *, precise: bool = False) -> str:
     """Format a duration compactly, without implying second-level ETA accuracy."""
-    total_minutes = max(0, int(seconds // 60))
-    hours, minutes = divmod(total_minutes, 60)
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
     if hours:
         return f"{hours}h {minutes:02d}m"
-    if total_minutes:
-        return f"{total_minutes}m"
-    return "<1m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s" if precise else f"{minutes}m"
+    return f"{seconds}s" if precise else "<1m"
+
+
+def _flush_logger(logger: logging.Logger) -> None:
+    """Flush the handlers that can receive a record from *logger*."""
+    current: logging.Logger | None = logger
+    while current is not None:
+        for handler in current.handlers:
+            handler.flush()
+        if not current.propagate:
+            break
+        current = current.parent
 
 
 @dataclass
 class ProgressTracker:
-    """Maintain indexing counters in memory and periodically log a snapshot."""
+    """Keep arbitrary phase counters in memory and periodically log progress."""
 
     logger: logging.Logger
-    total_assets: int
-    total_bytes: int
-    previously_hashed: int
-    previously_hashed_bytes: int
+    phase_name: str
+    total_items: int
+    phase: str = ""
+    verb: str = "Processed"
+    total_bytes: int | None = None
+    initial_items: int = 0
+    initial_bytes: int = 0
+    byte_based: bool = False
     clock: Callable[[], float] = time.monotonic
     file_interval: int = 500
     time_interval: float = 30.0
-    newly_hashed: int = 0
+    succeeded: int = 0
     failed: int = 0
     bytes_processed: int = 0
     _started_at: float = field(init=False)
@@ -53,6 +69,8 @@ class ProgressTracker:
     _last_logged_files: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
+        if not self.phase:
+            self.phase = self.phase_name
         self._started_at = self.clock()
         self._last_logged_at = self._started_at
 
@@ -62,15 +80,16 @@ class ProgressTracker:
 
     @property
     def attempted(self) -> int:
-        return self.newly_hashed + self.failed
+        return self.succeeded + self.failed
 
     @property
-    def completed_assets(self) -> int:
-        return self.previously_hashed + self.newly_hashed
+    def completed_items(self) -> int:
+        return self.initial_items + self.succeeded
 
     @property
     def completed_bytes(self) -> int:
-        return min(self.total_bytes, self.previously_hashed_bytes + self.bytes_processed)
+        value = self.initial_bytes + self.bytes_processed
+        return min(self.total_bytes, value) if self.total_bytes is not None else value
 
     @property
     def average_bytes_per_second(self) -> float:
@@ -79,13 +98,15 @@ class ProgressTracker:
 
     @property
     def eta_seconds(self) -> float | None:
+        if self.total_bytes is None:
+            return None
         speed = self.average_bytes_per_second
         if speed <= 0:
             return None
         return max(0.0, self.total_bytes - self.completed_bytes) / speed
 
-    def record_success(self, size: int) -> None:
-        self.newly_hashed += 1
+    def record_success(self, size: int = 0) -> None:
+        self.succeeded += 1
         self.bytes_processed += size
         self._maybe_log()
 
@@ -101,30 +122,25 @@ class ProgressTracker:
         ):
             return
         self.logger.info(self.progress_message())
+        _flush_logger(self.logger)
         self._last_logged_files = self.attempted
         self._last_logged_at = now
 
     def progress_message(self) -> str:
-        percent = 100.0 * self.completed_bytes / self.total_bytes if self.total_bytes else 100.0
-        eta = self.eta_seconds
-        eta_text = format_duration(eta) if eta is not None else "calculating"
+        if self.byte_based:
+            total_bytes = self.total_bytes or 0
+            percent = 100.0 * self.completed_bytes / total_bytes if total_bytes else 100.0
+            eta = self.eta_seconds
+            eta_text = format_duration(eta) if eta is not None else "calculating"
+            return (
+                f"{self.phase} | {self.verb} {self.completed_items:,} / {self.total_items:,} "
+                f"canonical assets ({percent:.1f}%) | {format_bytes(self.completed_bytes)} / "
+                f"{format_bytes(total_bytes)} | "
+                f"{format_bytes(round(self.average_bytes_per_second))}/s | ETA {eta_text}"
+            )
+        percent = 100.0 * self.attempted / self.total_items if self.total_items else 100.0
         return (
-            f"Indexed {self.completed_assets:,} / {self.total_assets:,} canonical assets "
-            f"({percent:.1f}%) | {format_bytes(self.completed_bytes)} / "
-            f"{format_bytes(self.total_bytes)} | "
-            f"{format_bytes(round(self.average_bytes_per_second))}/s | ETA {eta_text}"
-        )
-
-    def final_summary(self) -> str:
-        return (
-            "Canonical indexing completed\n\n"
-            "Assets:\n"
-            f"  Total ............ {self.total_assets:,}\n"
-            f"  Newly hashed ..... {self.newly_hashed:,}\n"
-            f"  Previously hashed  {self.previously_hashed:,}\n"
-            f"  Failed ........... {self.failed:,}\n\n"
-            "Data:\n"
-            f"  Processed ........ {format_bytes(self.completed_bytes)}\n"
-            f"  Elapsed .......... {format_duration(self.elapsed)}\n"
-            f"  Average speed .... {format_bytes(round(self.average_bytes_per_second))}/s"
+            f"{self.phase} | {self.verb} {self.attempted:,} / {self.total_items:,} "
+            f"({percent:.1f}%) | {format_bytes(self.bytes_processed)} | "
+            f"{format_duration(self.elapsed, precise=True)} elapsed"
         )

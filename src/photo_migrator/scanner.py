@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,7 +40,10 @@ class Scanner:
         self.config = config
 
     def scan(
-        self, sources: tuple[SourceConfig, ...] | None = None, role: str = "candidate"
+        self,
+        sources: tuple[SourceConfig, ...] | None = None,
+        role: str = "candidate",
+        progress: Callable[[int | None], None] | None = None,
     ) -> ScanResult:
         """Scan all roots, leaving a durable run record even when scanning fails."""
         selected = sources if sources is not None else self.config.sources
@@ -47,7 +51,7 @@ class Scanner:
         result = ScanResult()
         try:
             for source in selected:
-                self._scan_source(source, result, role)
+                self._scan_source(source, result, role, progress)
         except BaseException as exc:
             message = f"scan failed: {type(exc).__name__}: {exc}"
             LOGGER.exception(message)
@@ -63,7 +67,11 @@ class Scanner:
         return result
 
     def _scan_source(
-        self, source: SourceConfig, result: ScanResult, role: str = "candidate"
+        self,
+        source: SourceConfig,
+        result: ScanResult,
+        role: str = "candidate",
+        progress: Callable[[int | None], None] | None = None,
     ) -> None:
         seen: set[str] = set()
         source_had_error = False
@@ -125,9 +133,13 @@ class Scanner:
                     )
                     seen.add(absolute)
                     result.indexed += 1
+                    if progress is not None:
+                        progress(metadata.st_size)
                 except (OSError, ValueError) as exc:
                     source_had_error = True
                     self._record_error(result, path, "stat/containment", exc)
+                    if progress is not None:
+                        progress(None)
             pending.extend(reversed(child_directories))
         if not source_had_error:
             self.database.mark_missing(source.name, seen)
