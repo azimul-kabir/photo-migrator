@@ -38,13 +38,16 @@ class Scanner:
         self.database = database
         self.config = config
 
-    def scan(self) -> ScanResult:
+    def scan(
+        self, sources: tuple[SourceConfig, ...] | None = None, role: str = "candidate"
+    ) -> ScanResult:
         """Scan all roots, leaving a durable run record even when scanning fails."""
-        run_id = self.database.start_run(len(self.config.sources))
+        selected = sources if sources is not None else self.config.sources
+        run_id = self.database.start_run(len(selected))
         result = ScanResult()
         try:
-            for source in self.config.sources:
-                self._scan_source(source, result)
+            for source in selected:
+                self._scan_source(source, result, role)
         except BaseException as exc:
             message = f"scan failed: {type(exc).__name__}: {exc}"
             LOGGER.exception(message)
@@ -59,7 +62,9 @@ class Scanner:
         )
         return result
 
-    def _scan_source(self, source: SourceConfig, result: ScanResult) -> None:
+    def _scan_source(
+        self, source: SourceConfig, result: ScanResult, role: str = "candidate"
+    ) -> None:
         seen: set[str] = set()
         source_had_error = False
         pending = [source.path]
@@ -115,6 +120,7 @@ class Scanner:
                             "device_id": metadata.st_dev,
                             "inode": metadata.st_ino,
                             "media_type": _media_type(extension),
+                            "asset_role": role,
                         }
                     )
                     seen.add(absolute)

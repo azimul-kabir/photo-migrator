@@ -16,6 +16,7 @@ from photo_migrator.database import Database
 from photo_migrator.db_tools import backup_database, check_database
 from photo_migrator.doctor import run_doctor
 from photo_migrator.hashing import HashEngine
+from photo_migrator.incremental import IncrementalImporter
 from photo_migrator.logging_config import configure_logging
 from photo_migrator.planner import Planner
 from photo_migrator.recovery import audit
@@ -35,12 +36,14 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     init = subparsers.add_parser("init", help="initialize an inventory database")
     init.add_argument("--database", type=Path, required=True)
-    scan = subparsers.add_parser("scan", help="scan configured sources")
+    scan = subparsers.add_parser("scan", help="legacy full-migration: scan configured sources")
     scan.add_argument("--database", type=Path, required=True)
     scan.add_argument("--config", type=Path, required=True)
     stats = subparsers.add_parser("stats", help="show inventory statistics")
     stats.add_argument("--database", type=Path, required=True)
-    hash_command = subparsers.add_parser("hash", help="hash exact-duplicate candidates")
+    hash_command = subparsers.add_parser(
+        "hash", help="legacy full-migration: hash duplicate candidates"
+    )
     hash_command.add_argument("--database", type=Path, required=True)
     hash_command.add_argument("--workers", type=int, default=1)
     hash_command.add_argument("--limit", type=int)
@@ -62,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     relate.add_argument("--resume", action="store_true")
     relate.add_argument("--retry-failed", action="store_true")
     relate.add_argument("--ffprobe", default="ffprobe")
-    plan = subparsers.add_parser("plan", help="create a read-only migration plan")
+    plan = subparsers.add_parser("plan", help="legacy full-migration: create a migration plan")
     plan.add_argument("--database", type=Path, required=True)
     plan.add_argument("--config", type=Path, required=True)
     plan.add_argument("--source")
@@ -118,6 +121,29 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--json", action="store_true")
     recover.add_argument("--mark-stale-failed", action="store_true")
     recover.add_argument("--older-than-minutes", type=int)
+    library_index = subparsers.add_parser(
+        "library-index", help="index the existing canonical library"
+    )
+    library_index.add_argument("--database", type=Path, required=True)
+    library_index.add_argument("--config", type=Path, required=True)
+    library_index.add_argument("--workers", type=int, default=1)
+    library_index.add_argument("--resume", action="store_true")
+    import_scan = subparsers.add_parser("import-scan", help="scan read-only candidate sources")
+    import_scan.add_argument("--database", type=Path, required=True)
+    import_scan.add_argument("--config", type=Path, required=True)
+    import_plan = subparsers.add_parser(
+        "import-plan", help="plan content absent from the canonical library"
+    )
+    import_plan.add_argument("--database", type=Path, required=True)
+    import_plan.add_argument("--config", type=Path, required=True)
+    import_plan.add_argument("--source")
+    import_plan.add_argument("--limit", type=int)
+    import_run = subparsers.add_parser("import-run", help="execute a copy-only incremental import")
+    import_run.add_argument("--database", type=Path, required=True)
+    import_run.add_argument("--config", type=Path, required=True)
+    import_run.add_argument("--plan-id", type=int, required=True)
+    import_run.add_argument("--dry-run", action="store_true")
+    import_run.add_argument("--confirm", action="store_true")
     return parser
 
 
@@ -184,6 +210,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"errors={len(result.errors)}"
             )
             return 0 if not result.errors else 2
+        if args.command in {"library-index", "import-scan", "import-plan", "import-run"}:
+            config = load_config(args.config)
+            with Database(args.database) as database:
+                database.initialize()
+                importer = IncrementalImporter(database, config)
+                if args.command == "library-index":
+                    result = importer.library_index(args.workers, args.resume)
+                    print(
+                        f"Library index complete: indexed={result.indexed} errors={len(result.errors)}"
+                    )
+                    return 0 if not result.errors else 2
+                if args.command == "import-scan":
+                    result = importer.import_scan()
+                    print(
+                        f"Import scan complete: indexed={result.indexed} errors={len(result.errors)}"
+                    )
+                    return 0 if not result.errors else 2
+                if args.command == "import-plan":
+                    plan_id = importer.plan(args.source, args.limit)
+                    print(f"Import plan {plan_id} ready")
+                    return 0
+                run_id = importer.run(args.plan_id, args.dry_run or not args.confirm, args.confirm)
+                print(f"Import run {run_id} complete")
+                return 0
         if args.command == "hash":
             with Database(args.database) as database:
                 database.initialize()
@@ -256,6 +306,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Missing assets: {stats['missing']}")
         print(f"Scan errors: {stats['errors']}")
         print(f"Total bytes: {stats['bytes']}")
+        print(f"Canonical file count: {stats['canonical_count']}")
+        print(f"Canonical bytes: {stats['canonical_bytes']}")
+        print(f"Canonical hashed count: {stats['canonical_hashed']}")
+        print(f"Candidate file count: {stats['candidate_count']}")
+        import_plan = stats["latest_import_plan"]
+        print(f"Latest import plan ID: {import_plan['id'] if import_plan else 'none'}")
+        print(f"Candidates already present: {import_plan['duplicate_count'] if import_plan else 0}")
+        print(f"Candidates planned as new: {import_plan['new_count'] if import_plan else 0}")
+        print(
+            f"Bytes avoided through existing duplicates: {import_plan['bytes_avoided'] if import_plan else 0}"
+        )
+        import_run = stats["latest_import_run"]
+        print(f"Latest import run ID: {import_run['id'] if import_run else 'none'}")
         print("Totals by source:")
         for row in stats["by_source"]:
             print(f"  {row['source_name']}: {row['count']}")
