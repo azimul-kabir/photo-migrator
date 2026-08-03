@@ -127,7 +127,13 @@ def build_parser() -> argparse.ArgumentParser:
     library_index.add_argument("--database", type=Path, required=True)
     library_index.add_argument("--config", type=Path, required=True)
     library_index.add_argument("--workers", type=int, default=1)
-    library_index.add_argument("--resume", action="store_true")
+    index_mode = library_index.add_mutually_exclusive_group()
+    index_mode.add_argument(
+        "--resume", action="store_true", help="skip reconciliation and hash pending inventory"
+    )
+    index_mode.add_argument(
+        "--rescan", action="store_true", help="explicitly perform the default full reconciliation"
+    )
     import_scan = subparsers.add_parser("import-scan", help="scan read-only candidate sources")
     import_scan.add_argument("--database", type=Path, required=True)
     import_scan.add_argument("--config", type=Path, required=True)

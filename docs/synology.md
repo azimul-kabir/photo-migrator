@@ -37,4 +37,11 @@ uv run photo-migrator doctor --database /volume1/docker/photo-migrator-data/phot
 uv run photo-migrator db backup --database /volume1/docker/photo-migrator-data/photo.db --output /volume1/docker/photo-migrator-data/photo-before-run.db --verify
 ```
 
+Run `library-index` normally to fully scan and reconcile `CleanLibrary`, then hash new or changed
+assets. If hashing is interrupted (for example, by a power failure), restart with
+`library-index --resume`: this skips the slow NAS directory scan and validates and hashes only
+pending inventory rows. Use normal `library-index` again after any file is added, deleted, moved,
+or modified in `CleanLibrary`; `--rescan` is an explicit spelling of that default behavior. Fast
+resume review items are written to `reports/library_resume_review.csv`.
+
 For safe upgrades, stop active work, back up the database, run `git pull`, `uv sync --frozen`, and doctor again. Recovery and rollback only act on database status or verified files owned by a build; inspect dry-run reports first. Hardlinks require source and destination on the same filesystem and make both names refer to the same data: never use hardlink mode if destination files might be edited. Begin with copy mode and a small source. Follow [the first-run runbook](first-run.md).

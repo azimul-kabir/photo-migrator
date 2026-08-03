@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -163,4 +164,70 @@ def test_partial_and_fully_indexed_library(
             importer.library_index(resume=True)
         assert "Already hashed   : 2" in caplog.messages
         assert "Remaining hashes : 0" in caplog.messages
+        assert "Canonical library already fully indexed." in caplog.messages
+
+
+def test_fast_resume_skips_scan_and_reviews_changed_and_missing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    database, importer = _importer(
+        tmp_path, {"done.jpg": b"done", "pending.jpg": b"pending", "missing.jpg": b"gone"}
+    )
+    with database:
+        importer.library_index()
+        database.connection.execute(
+            "UPDATE assets SET sha256=NULL,hash_status='pending' WHERE filename!='done.jpg'"
+        )
+        database.connection.commit()
+        library = tmp_path / "library"
+        (library / "pending.jpg").write_bytes(b"changed-size")
+        (library / "missing.jpg").unlink()
+        caplog.clear()
+        with (
+            patch("photo_migrator.incremental.Scanner.scan") as scan,
+            caplog.at_level(logging.INFO),
+        ):
+            result = importer.library_index(resume=True)
+
+        scan.assert_not_called()
+        assert len(result.errors) == 2
+        done = database.connection.execute(
+            "SELECT sha256,hash_status FROM assets WHERE filename='done.jpg'"
+        ).fetchone()
+        assert done["sha256"] is not None and done["hash_status"] == "completed"
+        changed = database.connection.execute(
+            "SELECT hash_status,hash_error FROM assets WHERE filename='pending.jpg'"
+        ).fetchone()
+        assert changed["hash_status"] == "failed"
+        assert changed["hash_error"] == "refresh_required: size_changed"
+        assert "Fast resume requested." in caplog.messages
+        assert "Canonical rescan skipped." in caplog.messages
+        assert not any("Phase 1" in message for message in caplog.messages)
+        report = (tmp_path / "reports" / "library_resume_review.csv").read_text()
+        assert "size_changed" in report and "missing" in report
+
+
+def test_fast_resume_hashes_unchanged_pending_then_is_noop(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    database, importer = _importer(tmp_path, {"one.jpg": b"one", "two.jpg": b"two"})
+    with database:
+        importer.library_index()
+        original = database.connection.execute(
+            "SELECT sha256 FROM assets WHERE filename='one.jpg'"
+        ).fetchone()[0]
+        database.connection.execute(
+            "UPDATE assets SET sha256=NULL,hash_status='running' WHERE filename='two.jpg'"
+        )
+        database.connection.commit()
+        assert not importer.library_index(resume=True).errors
+        assert (
+            database.connection.execute(
+                "SELECT sha256 FROM assets WHERE filename='one.jpg'"
+            ).fetchone()[0]
+            == original
+        )
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            assert not importer.library_index(resume=True).errors
         assert "Canonical library already fully indexed." in caplog.messages
