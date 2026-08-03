@@ -17,6 +17,19 @@ photo-migrator import-run --database photo.db --config config.toml --plan-id 1 -
 photo-migrator import-run --database photo.db --config config.toml --plan-id 1 --confirm
 ```
 
+`library-index` is resumable: completed SHA-256 hashes are reused, so it is safe to terminate the
+command and restart it later. During hashing it logs progress every 500 assets or 30 seconds,
+whichever comes first. Percent complete and ETA are byte-based, which better represents libraries
+containing a mix of photos and large videos. A resumed run looks like:
+
+```text
+INFO Canonical assets: 97,214
+INFO Already hashed: 88,503
+INFO Remaining: 8,711
+INFO Resuming previous index...
+INFO Indexed 90,000 / 97,214 canonical assets (93.1%) | 3.48 TiB / 3.74 TiB | 247 MiB/s | ETA 18m
+```
+
 Planning compares sizes first and hashes a candidate only when canonical files share its size.
 Exact matches record the canonical path and avoid a copy. Real runs are copy-only and verify size
 and SHA-256. The older commands remain the **legacy full-migration workflow**.

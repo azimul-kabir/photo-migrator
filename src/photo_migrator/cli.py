@@ -217,9 +217,6 @@ def main(argv: Sequence[str] | None = None) -> int:
                 importer = IncrementalImporter(database, config)
                 if args.command == "library-index":
                     result = importer.library_index(args.workers, args.resume)
-                    print(
-                        f"Library index complete: indexed={result.indexed} errors={len(result.errors)}"
-                    )
                     return 0 if not result.errors else 2
                 if args.command == "import-scan":
                     result = importer.import_scan()

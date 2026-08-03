@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -12,7 +13,10 @@ from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, ConfigError, SourceConfig
 from photo_migrator.database import Database, utc_now
 from photo_migrator.filesystem_safety import safe_destination, sha256_file
+from photo_migrator.progress import ProgressTracker
 from photo_migrator.scanner import Scanner, ScanResult
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _require(config: Config) -> Path:
@@ -31,10 +35,34 @@ class IncrementalImporter:
         result = Scanner(self.database, self.config).scan(
             (SourceConfig("canonical-library", root, 0),), "canonical"
         )
+        totals = self.database.connection.execute(
+            """SELECT COUNT(*) AS total_assets, COALESCE(SUM(size_bytes), 0) AS total_bytes,
+            COALESCE(SUM(CASE WHEN hash_status='completed' AND sha256 IS NOT NULL THEN 1 ELSE 0 END), 0)
+                AS previously_hashed,
+            COALESCE(SUM(CASE WHEN hash_status='completed' AND sha256 IS NOT NULL THEN size_bytes ELSE 0 END), 0)
+                AS previously_hashed_bytes
+            FROM assets WHERE asset_role='canonical' AND scan_status='available'"""
+        ).fetchone()
         rows = self.database.connection.execute(
             """SELECT * FROM assets WHERE asset_role='canonical' AND scan_status='available'
             AND (hash_status!='completed' OR sha256 IS NULL) ORDER BY id"""
         ).fetchall()
+        tracker = ProgressTracker(
+            LOGGER,
+            int(totals["total_assets"]),
+            int(totals["total_bytes"]),
+            int(totals["previously_hashed"]),
+            int(totals["previously_hashed_bytes"]),
+        )
+        LOGGER.info("Canonical assets: %s", f"{tracker.total_assets:,}")
+        LOGGER.info("Already hashed: %s", f"{tracker.previously_hashed:,}")
+        LOGGER.info("Remaining: %s", f"{len(rows):,}")
+        if not rows:
+            LOGGER.info("Canonical library already fully indexed.")
+            self._library_reports()
+            return result
+        if tracker.previously_hashed:
+            LOGGER.info("Resuming previous index...")
         for row in rows:
             try:
                 digest, size = sha256_file(Path(row["absolute_path"]))
@@ -45,6 +73,7 @@ class IncrementalImporter:
                         "UPDATE assets SET sha256=?,hash_algorithm='sha256',hash_status='completed',hash_completed_at=? WHERE id=?",
                         (digest, utc_now(), row["id"]),
                     )
+                tracker.record_success(size)
             except (OSError, ValueError) as exc:
                 result.errors.append(f"hash error for {row['absolute_path']}: {exc}")
                 with self.database.transaction() as connection:
@@ -52,7 +81,9 @@ class IncrementalImporter:
                         "UPDATE assets SET hash_status='failed',hash_error=? WHERE id=?",
                         (str(exc), row["id"]),
                     )
+                tracker.record_failure()
         self._library_reports()
+        LOGGER.info(tracker.final_summary())
         return result
 
     def import_scan(self) -> ScanResult:
