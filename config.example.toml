@@ -20,6 +20,13 @@ exclude_directory_names = [
 exclude_filename_suffixes = ["@SynoEAStream"]
 exclude_filename_prefixes = ["SYNOINDEX_"]
 
+[imports]
+default_directory = "Camera Imports/Unsorted"
+preserve_source_subdirectories = false
+
+[imports.source_destinations]
+MobileBackup = "Camera Imports/MobileBackup"
+
 [planning]
 destination_root = "/volume1/photo/CleanLibrary"
 date_fallback = "undated"
@@ -39,3 +46,5 @@ prefer_relationship_complete_asset = true
 [planning.source_overrides]
 MobileBackup = 100
 Originals = 80
+[library]
+root = "/volume1/photo/CleanLibrary"

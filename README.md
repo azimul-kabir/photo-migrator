@@ -2,6 +2,25 @@
 
 Photo Migrator is a safety-first utility for consolidating overlapping photo and video archives into one deduplicated, verified library suitable for Immich.
 
+## Incremental canonical-library workflow
+
+`CleanLibrary` is the permanent source of truth. Configure it as `[library].root`; configure only
+outside, read-only folders as `[[sources]]`. For a macOS Photos package, list only its `originals`
+directory—never the package root. Existing canonical media is indexed in place and is never
+renamed or reorganized. Candidate media is never modified or deleted.
+
+```bash
+photo-migrator library-index --database photo.db --config config.toml --resume
+photo-migrator import-scan --database photo.db --config config.toml
+photo-migrator import-plan --database photo.db --config config.toml
+photo-migrator import-run --database photo.db --config config.toml --plan-id 1 --dry-run
+photo-migrator import-run --database photo.db --config config.toml --plan-id 1 --confirm
+```
+
+Planning compares sizes first and hashes a candidate only when canonical files share its size.
+Exact matches record the canonical path and avoid a copy. Real runs are copy-only and verify size
+and SHA-256. The older commands remain the **legacy full-migration workflow**.
+
 The project lockfile is the deployment contract for Python 3.9–3.12. Use
 `uv sync --frozen --dev` for development or `uv sync --frozen` for runtime deployment. CI performs
 the frozen install and all checks on each supported Python version. Reports and JSON sidecars are

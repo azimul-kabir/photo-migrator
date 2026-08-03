@@ -234,6 +234,7 @@ class Database:
                 row["name"] for row in connection.execute("PRAGMA table_info(assets)").fetchall()
             }
             additions = {
+                "asset_role": "TEXT NOT NULL DEFAULT 'candidate' CHECK (asset_role IN ('candidate','canonical'))",
                 "sha256": "TEXT",
                 "hash_algorithm": "TEXT",
                 "hash_status": (
@@ -291,6 +292,34 @@ class Database:
             )
             connection.executescript(
                 """
+                CREATE INDEX IF NOT EXISTS idx_assets_role_size ON assets(asset_role,size_bytes);
+                CREATE TABLE IF NOT EXISTS import_plans (
+                    id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, status TEXT NOT NULL,
+                    library_root TEXT NOT NULL, source_filter TEXT, candidate_count INTEGER NOT NULL DEFAULT 0,
+                    new_count INTEGER NOT NULL DEFAULT 0, duplicate_count INTEGER NOT NULL DEFAULT 0,
+                    collision_count INTEGER NOT NULL DEFAULT 0, bytes_avoided INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS import_plan_items (
+                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES import_plans(id),
+                    candidate_asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    action TEXT NOT NULL CHECK(action IN ('new','duplicate_existing','reuse_destination','review')),
+                    destination_relative_path TEXT, canonical_asset_id INTEGER REFERENCES assets(id),
+                    matching_canonical_path TEXT, expected_size_bytes INTEGER NOT NULL,
+                    expected_sha256 TEXT, reason TEXT NOT NULL, UNIQUE(plan_id,candidate_asset_id)
+                );
+                CREATE TABLE IF NOT EXISTS import_runs (
+                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES import_plans(id),
+                    started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
+                    dry_run INTEGER NOT NULL, copied_count INTEGER NOT NULL DEFAULT 0,
+                    reused_count INTEGER NOT NULL DEFAULT 0, failed_count INTEGER NOT NULL DEFAULT 0,
+                    bytes_written INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS import_run_items (
+                    id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES import_runs(id),
+                    plan_item_id INTEGER NOT NULL REFERENCES import_plan_items(id), status TEXT NOT NULL,
+                    destination_path TEXT, sha256 TEXT, size_bytes INTEGER, owned INTEGER NOT NULL DEFAULT 0,
+                    error TEXT, UNIQUE(run_id,plan_item_id)
+                );
                 CREATE INDEX IF NOT EXISTS idx_assets_analysis_status
                     ON assets(analysis_status);
                 CREATE INDEX IF NOT EXISTS idx_assets_captured_at ON assets(captured_at);
@@ -355,6 +384,7 @@ class Database:
             asset["device_id"],
             asset["inode"],
             asset["media_type"],
+            asset.get("asset_role", "candidate"),
             now,
             now,
             now,
@@ -365,14 +395,15 @@ class Database:
                 """INSERT INTO assets(
                     source_name, source_priority, absolute_path, relative_path, filename, extension,
                     size_bytes, mtime_ns, device_id, inode, media_type, scan_status, error_message,
-                    first_seen_at, last_seen_at, missing_since, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', NULL, ?, ?, NULL, ?, ?)
+                    asset_role, first_seen_at, last_seen_at, missing_since, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'available', NULL, ?, ?, ?, NULL, ?, ?)
                 ON CONFLICT(absolute_path) DO UPDATE SET
                     source_name=excluded.source_name, source_priority=excluded.source_priority,
                     relative_path=excluded.relative_path, filename=excluded.filename,
                     extension=excluded.extension, size_bytes=excluded.size_bytes,
                     mtime_ns=excluded.mtime_ns, device_id=excluded.device_id, inode=excluded.inode,
                     media_type=excluded.media_type, scan_status='available', error_message=NULL,
+                    asset_role=excluded.asset_role,
                     last_seen_at=excluded.last_seen_at, missing_since=NULL,
                     updated_at=excluded.updated_at,
                     hash_status=CASE WHEN assets.size_bytes != excluded.size_bytes
@@ -462,6 +493,22 @@ class Database:
         latest_build = connection.execute(
             "SELECT * FROM build_runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        incremental = connection.execute(
+            """SELECT
+            SUM(asset_role='canonical' AND scan_status='available') canonical_count,
+            COALESCE(SUM(CASE WHEN asset_role='canonical' AND scan_status='available'
+                THEN size_bytes ELSE 0 END),0) canonical_bytes,
+            SUM(asset_role='canonical' AND scan_status='available' AND hash_status='completed')
+                canonical_hashed,
+            SUM(asset_role='candidate' AND scan_status='available') candidate_count
+            FROM assets"""
+        ).fetchone()
+        latest_import_plan = connection.execute(
+            "SELECT * FROM import_plans ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        latest_import_run = connection.execute(
+            "SELECT * FROM import_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
         plan_counts = None
         if latest_plan is not None:
             plan_counts = connection.execute(
@@ -512,4 +559,10 @@ class Database:
             "latest_plan": latest_plan,
             "latest_plan_counts": plan_counts,
             "latest_build_run": latest_build,
+            "canonical_count": incremental["canonical_count"] or 0,
+            "canonical_bytes": incremental["canonical_bytes"] or 0,
+            "canonical_hashed": incremental["canonical_hashed"] or 0,
+            "candidate_count": incremental["candidate_count"] or 0,
+            "latest_import_plan": latest_import_plan,
+            "latest_import_run": latest_import_run,
         }

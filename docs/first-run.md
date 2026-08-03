@@ -1,5 +1,9 @@
 # Safe first run
 
+Treat `CleanLibrary` as the permanent canonical source of truth and every `[[sources]]` folder as
+read-only. Run `library-index`, `import-scan`, `import-plan`, and `import-run --dry-run` in that
+order; review `reports/import_plan_<ID>/` before supplying `--confirm`.
+
 Use `uv sync --frozen` (`--dev` on a validation workstation). Before configuring real sources,
 run `uv run pytest tests/test_end_to_end.py` and confirm the Python 3.9–3.12 CI matrix is green for
 the deployed commit. Create and verify a database backup immediately before the first full build

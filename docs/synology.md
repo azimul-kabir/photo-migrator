@@ -1,5 +1,9 @@
 # Synology DSM deployment
 
+Configure `/volume1/photo/CleanLibrary` under `[library]`; it is the permanent source of truth.
+Candidate folders remain read-only. For Apple Photos configure only
+`/volume1/photo/Photos Library.photoslibrary/originals`, not the package root.
+
 Use Python 3.11 or 3.12 where DSM makes it available (the supported range is 3.9–3.12). If the NAS
 Python is older than 3.9, install a supported interpreter from a trusted package or container; do
 not bypass the project requirement. Deploy only the committed lock with `uv sync --frozen` and do

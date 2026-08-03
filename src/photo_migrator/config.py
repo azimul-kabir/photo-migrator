@@ -23,6 +23,18 @@ class SourceConfig:
 
 
 @dataclass(frozen=True)
+class LibraryConfig:
+    root: Path
+
+
+@dataclass(frozen=True)
+class ImportsConfig:
+    default_directory: Path
+    preserve_source_subdirectories: bool
+    source_destinations: tuple[tuple[str, Path], ...]
+
+
+@dataclass(frozen=True)
 class ScanConfig:
     extensions: frozenset[str]
     exclude_directory_names: frozenset[str]
@@ -57,6 +69,8 @@ class Config:
     sources: tuple[SourceConfig, ...]
     scan: ScanConfig
     planning: PlanningConfig | None = None
+    library: LibraryConfig | None = None
+    imports: ImportsConfig | None = None
 
 
 SUPPORTED_TEMPLATE_FIELDS = frozenset(
@@ -171,7 +185,7 @@ def load_config(path: Path) -> Config:
     for item in raw_sources:
         if not isinstance(item, dict):
             raise ConfigError("each source must be a table")
-        name, source_path, priority = item.get("name"), item.get("path"), item.get("priority")
+        name, source_path, priority = item.get("name"), item.get("path"), item.get("priority", 0)
         if not isinstance(name, str) or not name.strip():
             raise ConfigError("source name must be a non-empty string")
         if name in seen_names:
@@ -187,7 +201,7 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"source {name} does not exist: {candidate}") from exc
         if not resolved.is_dir():
             raise ConfigError(f"source {name} is not a directory: {resolved}")
-        if "CleanLibrary" in resolved.parts:
+        if raw.get("library") is None and "CleanLibrary" in resolved.parts:
             raise ConfigError(f"source {name} is under reserved CleanLibrary: {resolved}")
         if resolved in seen_paths:
             raise ConfigError(f"duplicate source path: {resolved}")
@@ -203,6 +217,46 @@ def load_config(path: Path) -> Config:
         normalized_extensions.add(extension.lower())
     if not normalized_extensions:
         raise ConfigError("scan.extensions must not be empty")
+
+    library = None
+    raw_library = raw.get("library")
+    if raw_library is not None:
+        if not isinstance(raw_library, dict) or not isinstance(raw_library.get("root"), str):
+            raise ConfigError("library.root must be an absolute existing directory")
+        library_path = Path(raw_library["root"]).expanduser()
+        if not library_path.is_absolute():
+            raise ConfigError("library.root must be absolute")
+        try:
+            library_root = library_path.resolve(strict=True)
+        except OSError as exc:
+            raise ConfigError(f"library root does not exist: {library_path}") from exc
+        if not library_root.is_dir():
+            raise ConfigError(f"library root is not a directory: {library_root}")
+        if any(s.path == library_root or s.path.is_relative_to(library_root) for s in sources):
+            raise ConfigError("candidate sources must be outside library.root")
+        library = LibraryConfig(library_root)
+
+    imports = None
+    raw_imports = raw.get("imports")
+    if raw_imports is not None:
+        if not isinstance(raw_imports, dict):
+            raise ConfigError("imports must be a table")
+        default = _safe_relative_directory(
+            raw_imports.get("default_directory", "Camera Imports/Unsorted"),
+            "imports.default_directory",
+        )
+        destinations = raw_imports.get("source_destinations", {})
+        if not isinstance(destinations, dict):
+            raise ConfigError("imports.source_destinations must be a table")
+        mapped = tuple(
+            sorted(
+                (name, _safe_relative_directory(value, f"imports.source_destinations.{name}"))
+                for name, value in destinations.items()
+            )
+        )
+        imports = ImportsConfig(
+            default, bool(raw_imports.get("preserve_source_subdirectories", False)), mapped
+        )
 
     return Config(
         sources=tuple(sources),
@@ -223,4 +277,15 @@ def load_config(path: Path) -> Config:
             ),
         ),
         planning=_planning(raw.get("planning"), sources),
+        library=library,
+        imports=imports,
     )
+
+
+def _safe_relative_directory(value: Any, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ConfigError(f"{field} must be a non-empty relative path")
+    path = Path(value)
+    if path.is_absolute() or ".." in path.parts or "." in path.parts:
+        raise ConfigError(f"{field} must be a contained relative path")
+    return path

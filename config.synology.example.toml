@@ -1,4 +1,7 @@
 # REVIEW AND EDIT every path before use. This file contains no secrets.
+[library]
+root = "/volume1/photo/CleanLibrary"
+
 [[sources]]
 name = "originals"
 path = "/volume1/photo/originals"
@@ -20,14 +23,21 @@ name = "ios"
 path = "/volume1/photo/ios"
 priority = 60
 [[sources]]
-name = "family-videos"
-path = "/volume1/photo/family videos"
+name = "photos-library-originals"
+path = "/volume1/photo/Photos Library.photoslibrary/originals"
 priority = 50
 [scan]
 extensions = [".jpg", ".jpeg", ".png", ".heic", ".mov", ".mp4"]
 exclude_directory_names = ["@eaDir", "#recycle", "Photos Library.photoslibrary", "CleanLibrary"]
 exclude_filename_suffixes = []
 exclude_filename_prefixes = []
+[imports]
+default_directory = "Camera Imports/Unsorted"
+preserve_source_subdirectories = false
+[imports.source_destinations]
+mobile-backup = "Camera Imports/MobileBackup"
+ios = "Camera Imports/iOS"
+photos-library-originals = "Camera Imports/Photos Library Recovery"
 [planning]
 destination_root = "/volume1/photo/CleanLibrary"
 date_fallback = "undated"
