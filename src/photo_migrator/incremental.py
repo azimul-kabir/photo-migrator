@@ -13,7 +13,7 @@ from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, ConfigError, SourceConfig
 from photo_migrator.database import Database, utc_now
 from photo_migrator.filesystem_safety import safe_destination, sha256_file
-from photo_migrator.progress import ProgressTracker
+from photo_migrator.progress import ProgressTracker, format_bytes, format_duration
 from photo_migrator.scanner import Scanner, ScanResult
 
 LOGGER = logging.getLogger(__name__)
@@ -32,9 +32,40 @@ class IncrementalImporter:
     def library_index(self, workers: int = 1, resume: bool = False) -> ScanResult:
         del workers, resume  # hashing is deliberately serialized with SQLite writes
         root = _require(self.config)
-        result = Scanner(self.database, self.config).scan(
-            (SourceConfig("canonical-library", root, 0),), "canonical"
+        before = self.database.connection.execute(
+            """SELECT COUNT(*) AS total_assets, COALESCE(SUM(size_bytes), 0) AS total_bytes,
+            COALESCE(SUM(CASE WHEN hash_status='completed' AND sha256 IS NOT NULL THEN 1 ELSE 0 END), 0)
+                AS previously_hashed
+            FROM assets WHERE asset_role='canonical' AND scan_status='available'"""
+        ).fetchone()
+        expected_assets = int(before["total_assets"])
+        already_hashed = int(before["previously_hashed"])
+        LOGGER.info("Canonical assets : %s", f"{expected_assets:,}")
+        LOGGER.info("Already hashed   : %s", f"{already_hashed:,}")
+        LOGGER.info("Remaining hashes : %s", f"{expected_assets - already_hashed:,}")
+        LOGGER.info("")
+        LOGGER.info("Phase 1/2: Scanning canonical library...")
+        scan_tracker = ProgressTracker(
+            LOGGER,
+            phase_name="Scanning canonical library",
+            total_items=expected_assets,
+            total_bytes=int(before["total_bytes"]),
+            phase="Phase 1/2",
+            verb="Scanned",
         )
+
+        def record_scan(size: int | None) -> None:
+            if size is None:
+                scan_tracker.record_failure()
+            else:
+                scan_tracker.record_success(size)
+
+        result = Scanner(self.database, self.config).scan(
+            (SourceConfig("canonical-library", root, 0),), "canonical", record_scan
+        )
+        LOGGER.info("Phase 1 complete.")
+        LOGGER.info("")
+        LOGGER.info("Phase 2/2: Hashing remaining canonical assets...")
         totals = self.database.connection.execute(
             """SELECT COUNT(*) AS total_assets, COALESCE(SUM(size_bytes), 0) AS total_bytes,
             COALESCE(SUM(CASE WHEN hash_status='completed' AND sha256 IS NOT NULL THEN 1 ELSE 0 END), 0)
@@ -49,19 +80,22 @@ class IncrementalImporter:
         ).fetchall()
         tracker = ProgressTracker(
             LOGGER,
-            int(totals["total_assets"]),
-            int(totals["total_bytes"]),
-            int(totals["previously_hashed"]),
-            int(totals["previously_hashed_bytes"]),
+            phase_name="Hashing remaining canonical assets",
+            total_items=int(totals["total_assets"]),
+            total_bytes=int(totals["total_bytes"]),
+            initial_items=int(totals["previously_hashed"]),
+            initial_bytes=int(totals["previously_hashed_bytes"]),
+            phase="Phase 2/2",
+            verb="Indexed",
+            byte_based=True,
         )
-        LOGGER.info("Canonical assets: %s", f"{tracker.total_assets:,}")
-        LOGGER.info("Already hashed: %s", f"{tracker.previously_hashed:,}")
-        LOGGER.info("Remaining: %s", f"{len(rows):,}")
         if not rows:
             LOGGER.info("Canonical library already fully indexed.")
             self._library_reports()
+            LOGGER.info(self._index_summary(tracker))
+            LOGGER.info("Library indexing complete.")
             return result
-        if tracker.previously_hashed:
+        if tracker.initial_items:
             LOGGER.info("Resuming previous index...")
         for row in rows:
             try:
@@ -83,8 +117,24 @@ class IncrementalImporter:
                     )
                 tracker.record_failure()
         self._library_reports()
-        LOGGER.info(tracker.final_summary())
+        LOGGER.info(self._index_summary(tracker))
+        LOGGER.info("Library indexing complete.")
         return result
+
+    @staticmethod
+    def _index_summary(tracker: ProgressTracker) -> str:
+        return (
+            "Canonical indexing completed\n\n"
+            "Assets:\n"
+            f"  Total ............ {tracker.total_items:,}\n"
+            f"  Newly hashed ..... {tracker.succeeded:,}\n"
+            f"  Previously hashed  {tracker.initial_items:,}\n"
+            f"  Failed ........... {tracker.failed:,}\n\n"
+            "Data:\n"
+            f"  Processed ........ {format_bytes(tracker.completed_bytes)}\n"
+            f"  Elapsed .......... {format_duration(tracker.elapsed)}\n"
+            f"  Average speed .... {format_bytes(round(tracker.average_bytes_per_second))}/s"
+        )
 
     def import_scan(self) -> ScanResult:
         _require(self.config)
