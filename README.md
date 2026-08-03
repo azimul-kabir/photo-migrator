@@ -10,15 +10,20 @@ directory—never the package root. Existing canonical media is indexed in place
 renamed or reorganized. Candidate media is never modified or deleted.
 
 ```bash
-photo-migrator library-index --database photo.db --config config.toml --resume
+photo-migrator library-index --database photo.db --config config.toml
 photo-migrator import-scan --database photo.db --config config.toml
 photo-migrator import-plan --database photo.db --config config.toml
 photo-migrator import-run --database photo.db --config config.toml --plan-id 1 --dry-run
 photo-migrator import-run --database photo.db --config config.toml --plan-id 1 --confirm
 ```
 
-`library-index` is resumable: completed SHA-256 hashes are reused, so it is safe to terminate the
-command and restart it later. Both scanning and hashing log progress every 500 assets or 30 seconds,
+Normal `library-index` performs a full reconciliation scan, marking new, changed, and missing
+canonical files before hashing incomplete assets. After interrupted hashing, use
+`library-index --resume` for fast hash-only recovery from the existing SQLite inventory; it skips
+the canonical scan, validates each pending file's containment, type, size, and modification time,
+and preserves completed hashes. Use normal `library-index` after adding, deleting, moving, or
+modifying anything in `CleanLibrary` (`--rescan` explicitly requests the same full behavior).
+Both scanning and hashing log progress every 500 assets or 30 seconds,
 whichever comes first. Hashing percent complete and ETA are byte-based, which better represents
 libraries containing a mix of photos and large videos. A production run looks like:
 

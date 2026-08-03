@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from photo_migrator.cli import main
 
 
@@ -26,3 +28,19 @@ def test_invalid_config_returns_error(tmp_path: Path) -> None:
         main(["scan", "--database", str(tmp_path / "db"), "--config", str(tmp_path / "missing")])
         == 2
     )
+
+
+def test_library_index_resume_and_rescan_are_mutually_exclusive(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "library-index",
+                "--database",
+                str(tmp_path / "db"),
+                "--config",
+                str(tmp_path / "config"),
+                "--resume",
+                "--rescan",
+            ]
+        )
+    assert error.value.code == 2

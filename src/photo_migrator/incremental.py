@@ -7,12 +7,13 @@ import hashlib
 import logging
 import os
 import sqlite3
+import stat
 from pathlib import Path
 
 from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, ConfigError, SourceConfig
 from photo_migrator.database import Database, utc_now
-from photo_migrator.filesystem_safety import safe_destination, sha256_file
+from photo_migrator.filesystem_safety import contained, safe_destination, sha256_file
 from photo_migrator.progress import ProgressTracker, format_bytes, format_duration
 from photo_migrator.scanner import Scanner, ScanResult
 
@@ -30,7 +31,7 @@ class IncrementalImporter:
         self.database, self.config = database, config
 
     def library_index(self, workers: int = 1, resume: bool = False) -> ScanResult:
-        del workers, resume  # hashing is deliberately serialized with SQLite writes
+        del workers  # hashing is deliberately serialized with SQLite writes
         root = _require(self.config)
         before = self.database.connection.execute(
             """SELECT COUNT(*) AS total_assets, COALESCE(SUM(size_bytes), 0) AS total_bytes,
@@ -40,31 +41,38 @@ class IncrementalImporter:
         ).fetchone()
         expected_assets = int(before["total_assets"])
         already_hashed = int(before["previously_hashed"])
-        LOGGER.info("Canonical assets : %s", f"{expected_assets:,}")
+        if resume:
+            LOGGER.info("Fast resume requested.")
+            LOGGER.info("Canonical rescan skipped.")
+        LOGGER.info(
+            "%sCanonical assets : %s", "Existing " if resume else "", f"{expected_assets:,}"
+        )
         LOGGER.info("Already hashed   : %s", f"{already_hashed:,}")
         LOGGER.info("Remaining hashes : %s", f"{expected_assets - already_hashed:,}")
         LOGGER.info("")
-        LOGGER.info("Phase 1/2: Scanning canonical library...")
-        scan_tracker = ProgressTracker(
-            LOGGER,
-            phase_name="Scanning canonical library",
-            total_items=expected_assets,
-            total_bytes=int(before["total_bytes"]),
-            phase="Phase 1/2",
-            verb="Scanned",
-        )
+        result = ScanResult()
+        if not resume:
+            LOGGER.info("Phase 1/2: Scanning canonical library...")
+            scan_tracker = ProgressTracker(
+                LOGGER,
+                phase_name="Scanning canonical library",
+                total_items=expected_assets,
+                total_bytes=int(before["total_bytes"]),
+                phase="Phase 1/2",
+                verb="Scanned",
+            )
 
-        def record_scan(size: int | None) -> None:
-            if size is None:
-                scan_tracker.record_failure()
-            else:
-                scan_tracker.record_success(size)
+            def record_scan(size: int | None) -> None:
+                if size is None:
+                    scan_tracker.record_failure()
+                else:
+                    scan_tracker.record_success(size)
 
-        result = Scanner(self.database, self.config).scan(
-            (SourceConfig("canonical-library", root, 0),), "canonical", record_scan
-        )
-        LOGGER.info("Phase 1 complete.")
-        LOGGER.info("")
+            result = Scanner(self.database, self.config).scan(
+                (SourceConfig("canonical-library", root, 0),), "canonical", record_scan
+            )
+            LOGGER.info("Phase 1 complete.")
+            LOGGER.info("")
         LOGGER.info("Phase 2/2: Hashing remaining canonical assets...")
         totals = self.database.connection.execute(
             """SELECT COUNT(*) AS total_assets, COALESCE(SUM(size_bytes), 0) AS total_bytes,
@@ -89,8 +97,11 @@ class IncrementalImporter:
             verb="Indexed",
             byte_based=True,
         )
+        review: list[tuple[object, ...]] = []
         if not rows:
             LOGGER.info("Canonical library already fully indexed.")
+            if resume:
+                self._resume_report(review)
             self._library_reports()
             LOGGER.info(self._index_summary(tracker))
             LOGGER.info("Library indexing complete.")
@@ -99,9 +110,31 @@ class IncrementalImporter:
             LOGGER.info("Resuming previous index...")
         for row in rows:
             try:
-                digest, size = sha256_file(Path(row["absolute_path"]))
-                if size != row["size_bytes"]:
+                path = Path(row["absolute_path"])
+                if resume:
+                    reason, observed_size, observed_mtime = self._resume_validation(path, root, row)
+                    if reason is not None:
+                        review.append(
+                            (
+                                row["id"],
+                                row["absolute_path"],
+                                reason,
+                                row["size_bytes"],
+                                observed_size,
+                                row["mtime_ns"],
+                                observed_mtime,
+                            )
+                        )
+                        self._mark_resume_review(row, reason)
+                        result.errors.append(f"fast resume skipped {path}: {reason}")
+                        tracker.record_failure()
+                        continue
+                digest, size = sha256_file(path)
+                info = path.lstat()
+                if size != row["size_bytes"] or info.st_size != row["size_bytes"]:
                     raise ValueError("canonical size changed while hashing")
+                if info.st_mtime_ns != row["mtime_ns"]:
+                    raise ValueError("canonical mtime changed while hashing")
                 with self.database.transaction() as connection:
                     connection.execute(
                         "UPDATE assets SET sha256=?,hash_algorithm='sha256',hash_status='completed',hash_completed_at=? WHERE id=?",
@@ -116,13 +149,25 @@ class IncrementalImporter:
                         (str(exc), row["id"]),
                     )
                 tracker.record_failure()
+        if resume:
+            self._resume_report(review)
         self._library_reports()
-        LOGGER.info(self._index_summary(tracker))
+        remaining = self.database.connection.execute(
+            """SELECT COUNT(*) FROM assets WHERE asset_role='canonical'
+            AND scan_status='available' AND (hash_status!='completed' OR sha256 IS NULL)"""
+        ).fetchone()[0]
+        missing = sum(item[2] == "missing" for item in review)
+        LOGGER.info(self._index_summary(tracker, len(review) - missing, missing, int(remaining)))
         LOGGER.info("Library indexing complete.")
         return result
 
     @staticmethod
-    def _index_summary(tracker: ProgressTracker) -> str:
+    def _index_summary(
+        tracker: ProgressTracker,
+        refresh_required: int = 0,
+        missing: int = 0,
+        remaining: int = 0,
+    ) -> str:
         return (
             "Canonical indexing completed\n\n"
             "Assets:\n"
@@ -130,10 +175,67 @@ class IncrementalImporter:
             f"  Newly hashed ..... {tracker.succeeded:,}\n"
             f"  Previously hashed  {tracker.initial_items:,}\n"
             f"  Failed ........... {tracker.failed:,}\n\n"
+            f"  Missing .......... {missing:,}\n"
+            f"  Refresh required . {refresh_required:,}\n"
+            f"  Remaining ........ {remaining:,}\n\n"
             "Data:\n"
             f"  Processed ........ {format_bytes(tracker.completed_bytes)}\n"
             f"  Elapsed .......... {format_duration(tracker.elapsed)}\n"
             f"  Average speed .... {format_bytes(round(tracker.average_bytes_per_second))}/s"
+        )
+
+    @staticmethod
+    def _resume_validation(
+        path: Path, root: Path, row: sqlite3.Row
+    ) -> tuple[str | None, int | None, int | None]:
+        """Validate an inventory entry without following a final-component symlink."""
+        if not contained(path.absolute(), root.absolute()):
+            return "unsafe_path", None, None
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return "missing", None, None
+        except OSError:
+            return "unsafe_path", None, None
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            return "non_regular_file", info.st_size, info.st_mtime_ns
+        try:
+            if not contained(path.resolve(strict=True), root.resolve(strict=True)):
+                return "unsafe_path", info.st_size, info.st_mtime_ns
+        except OSError:
+            return "unsafe_path", info.st_size, info.st_mtime_ns
+        if info.st_size != row["size_bytes"]:
+            return "size_changed", info.st_size, info.st_mtime_ns
+        if info.st_mtime_ns != row["mtime_ns"]:
+            return "mtime_changed", info.st_size, info.st_mtime_ns
+        return None, info.st_size, info.st_mtime_ns
+
+    def _mark_resume_review(self, row: sqlite3.Row, reason: str) -> None:
+        with self.database.transaction() as connection:
+            if reason == "missing":
+                connection.execute(
+                    "UPDATE assets SET scan_status='missing',missing_since=?,hash_error=? WHERE id=?",
+                    (utc_now(), "refresh_required: missing", row["id"]),
+                )
+            else:
+                connection.execute(
+                    "UPDATE assets SET hash_status='failed',hash_error=? WHERE id=?",
+                    (f"refresh_required: {reason}", row["id"]),
+                )
+
+    def _resume_report(self, rows: list[tuple[object, ...]]) -> None:
+        atomic_write_csv(
+            self.database.path.parent / "reports" / "library_resume_review.csv",
+            rows,
+            (
+                "asset_id",
+                "absolute_path",
+                "reason",
+                "stored_size",
+                "observed_size",
+                "stored_mtime_ns",
+                "observed_mtime_ns",
+            ),
         )
 
     def import_scan(self) -> ScanResult:
