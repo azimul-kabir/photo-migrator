@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -35,6 +35,31 @@ def _importer(tmp_path: Path, files: dict[str, bytes]) -> tuple[Database, Increm
     database = Database(tmp_path / "inventory.db")
     database.initialize()
     return database, IncrementalImporter(database, load_config(config_path))
+
+
+def _planned_import(
+    tmp_path: Path, files: dict[str, bytes]
+) -> tuple[Database, IncrementalImporter, int]:
+    library = tmp_path / "library"
+    source = tmp_path / "source"
+    library.mkdir()
+    source.mkdir()
+    for name, contents in files.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(contents)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        f'[[sources]]\nname="source"\npath="{source}"\npriority=1\n'
+        f'[library]\nroot="{library}"\n[scan]\nextensions=[".jpg"]\n'
+        '[imports]\ndefault_directory="Camera Imports"\n'
+        "preserve_source_subdirectories=true\n"
+    )
+    database = Database(tmp_path / "inventory.db")
+    database.initialize()
+    importer = IncrementalImporter(database, load_config(config_path))
+    importer.import_scan()
+    return database, importer, importer.plan()
 
 
 def test_progress_formatting_and_byte_percentage() -> None:
@@ -125,6 +150,76 @@ def test_scan_progress_logs_by_item_and_time(caplog: pytest.LogCaptureFixture) -
 
     assert "Scanned 500 / 1,000 (50.0%)" in caplog.messages[0]
     assert "Scanned 501 / 1,000 (50.1%)" in caplog.messages[1]
+
+
+def test_progress_flushes_handlers() -> None:
+    logger = logging.Logger("flush-progress")
+    handler = logging.NullHandler()
+    handler.flush = Mock()
+    logger.addHandler(handler)
+    tracker = ProgressTracker(logger, "Import", 1, file_interval=1)
+
+    tracker.record_success(1)
+
+    handler.flush.assert_called_once_with()
+
+
+def test_import_progress_and_final_summary(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    database, importer, plan_id = _planned_import(
+        tmp_path, {"album/one.jpg": b"one", "album/two.jpg": b"two"}
+    )
+    with database, caplog.at_level(logging.INFO):
+        run_id = importer.run(plan_id, dry_run=False, confirm=True)
+
+    assert run_id > 0
+    assert "Import plan            : 1" in caplog.messages
+    assert "Files to import        : 2" in caplog.messages
+    assert "Phase 1/1: Importing files..." in caplog.messages
+    summary = next(message for message in caplog.messages if message.startswith("Import Summary"))
+    assert "Planned ............ 2" in summary
+    assert "Copied ............. 2" in summary
+    assert "Failed ............. 0" in summary
+    assert "Copied ............. 6 B" in summary
+    assert caplog.messages[-1] == "Import complete."
+
+
+def test_resumed_and_empty_imports(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    database, importer, plan_id = _planned_import(tmp_path, {"one.jpg": b"one", "two.jpg": b"two"})
+    original_copy = importer._copy
+    calls = 0
+
+    def fail_second(*args: object, **kwargs: object) -> tuple[str, int]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic interruption")
+        return original_copy(*args, **kwargs)  # type: ignore[arg-type]
+
+    with database:
+        with patch.object(importer, "_copy", side_effect=fail_second):
+            importer.run(plan_id, dry_run=False, confirm=True)
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            importer.run(plan_id, dry_run=False, confirm=True)
+
+    assert "Resuming import" in caplog.messages
+    assert "Already copied ...... 1" in caplog.messages
+    assert "Remaining ........... 1" in caplog.messages
+    summary = next(message for message in caplog.messages if message.startswith("Import Summary"))
+    assert "Copied ............. 2" in summary
+
+    empty_root = tmp_path / "empty"
+    empty_root.mkdir()
+    empty_database, empty_importer, empty_plan = _planned_import(empty_root, {})
+    caplog.clear()
+    with empty_database, caplog.at_level(logging.INFO):
+        empty_importer.run(empty_plan, dry_run=False, confirm=True)
+    assert "Files to import        : 0" in caplog.messages
+    assert "Planned ............ 0" in next(
+        message for message in caplog.messages if message.startswith("Import Summary")
+    )
 
 
 def test_empty_library_has_no_work(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

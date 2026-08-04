@@ -14,7 +14,7 @@ from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, ConfigError, SourceConfig
 from photo_migrator.database import Database, utc_now
 from photo_migrator.filesystem_safety import contained, safe_destination, sha256_file
-from photo_migrator.progress import ProgressTracker, format_bytes, format_duration
+from photo_migrator.progress import ProgressTracker, flush_logger, format_bytes, format_duration
 from photo_migrator.scanner import Scanner, ScanResult
 
 LOGGER = logging.getLogger(__name__)
@@ -357,6 +357,39 @@ class IncrementalImporter:
                     (plan_id, utc_now(), int(dry_run)),
                 )
                 run_id = int(cur.lastrowid or 0)
+        action_totals = self.database.connection.execute(
+            """SELECT COUNT(*) AS planned,
+            COALESCE(SUM(CASE WHEN action='duplicate_existing' THEN 1 ELSE 0 END),0) AS skipped,
+            COALESCE(SUM(CASE WHEN action='reuse_destination' THEN 1 ELSE 0 END),0) AS reused,
+            COALESCE(SUM(CASE WHEN action='new' THEN expected_size_bytes ELSE 0 END),0) AS bytes
+            FROM import_plan_items WHERE plan_id=?""",
+            (plan_id,),
+        ).fetchone()
+        already_copied = int(prior["copied_count"]) if prior is not None else 0
+        already_written = int(prior["bytes_written"]) if prior is not None else 0
+        skipped = int(action_totals["skipped"])
+        reused = int(action_totals["reused"])
+        total_planned = int(action_totals["planned"])
+        total_bytes = int(action_totals["bytes"])
+        LOGGER.info("Import plan            : %s", plan_id)
+        LOGGER.info("Files to import        : %s", f"{total_planned:,}")
+        LOGGER.info("Existing duplicates    : %s", f"{skipped:,}")
+        LOGGER.info("Destination reuse      : %s", f"{reused:,}")
+        LOGGER.info("Data to copy           : %s", format_bytes(total_bytes))
+        LOGGER.info("")
+        LOGGER.info("Destination            : %s", root)
+        LOGGER.info("")
+        if already_copied:
+            LOGGER.info("Resuming import")
+            LOGGER.info("")
+            LOGGER.info("Already copied ...... %s", f"{already_copied:,}")
+            LOGGER.info(
+                "Remaining ........... %s",
+                f"{max(0, int(plan['new_count']) - already_copied):,}",
+            )
+            LOGGER.info("")
+        LOGGER.info("Phase 1/1: Importing files...")
+        flush_logger(LOGGER)
         rows = self.database.connection.execute(
             """SELECT i.*,a.absolute_path,a.filename,a.extension,a.mtime_ns,a.source_name,a.relative_path
             FROM import_plan_items i JOIN assets a ON a.id=i.candidate_asset_id
@@ -365,9 +398,24 @@ class IncrementalImporter:
             ORDER BY i.id""",
             (plan_id, run_id),
         ).fetchall()
+        tracker = ProgressTracker(
+            LOGGER,
+            phase_name="Importing files",
+            total_items=total_planned,
+            total_bytes=total_bytes,
+            initial_items=skipped + reused + already_copied,
+            initial_bytes=already_written,
+            phase="Phase 1/1",
+            verb="Imported",
+            byte_based=True,
+            item_based_percentage=True,
+            item_noun="files",
+            count_failures_as_completed=True,
+        )
         copied = failed = written = 0
         for row in rows:
             destination = safe_destination(root, Path(row["destination_relative_path"]))
+            tracker.current_item = str(row["destination_relative_path"])
             try:
                 if dry_run:
                     status, digest, size, owned = (
@@ -389,6 +437,7 @@ class IncrementalImporter:
                         "INSERT OR REPLACE INTO import_run_items(run_id,plan_item_id,status,destination_path,sha256,size_bytes,owned,error) VALUES (?,?,?,?,?,?,?,NULL)",
                         (run_id, row["id"], status, str(destination), digest, size, owned),
                     )
+                tracker.record_success(size if not dry_run else 0)
             except (OSError, ValueError) as exc:
                 failed += 1
                 with self.database.transaction() as connection:
@@ -396,6 +445,7 @@ class IncrementalImporter:
                         "INSERT OR REPLACE INTO import_run_items(run_id,plan_item_id,status,destination_path,owned,error) VALUES (?,?,'failed',?,0,?)",
                         (run_id, row["id"], str(destination), str(exc)),
                     )
+                tracker.record_failure()
         with self.database.transaction() as connection:
             connection.execute(
                 "UPDATE import_runs SET finished_at=?,status=?,copied_count=copied_count+?,failed_count=failed_count+?,bytes_written=bytes_written+? WHERE id=?",
@@ -409,7 +459,46 @@ class IncrementalImporter:
                 ),
             )
         self._run_reports(run_id)
+        LOGGER.info(
+            self._import_summary(
+                tracker,
+                total_planned,
+                already_copied + copied,
+                reused,
+                skipped,
+                failed,
+                root,
+            )
+        )
+        LOGGER.info("Import complete.")
+        flush_logger(LOGGER)
         return run_id
+
+    @staticmethod
+    def _import_summary(
+        tracker: ProgressTracker,
+        planned: int,
+        copied: int,
+        reused: int,
+        skipped: int,
+        failed: int,
+        destination: Path,
+    ) -> str:
+        return (
+            "Import Summary\n"
+            "==============\n\n"
+            "Files\n\n"
+            f"Planned ............ {planned:,}\n"
+            f"Copied ............. {copied:,}\n"
+            f"Reused ............. {reused:,}\n"
+            f"Skipped ............ {skipped:,}\n"
+            f"Failed ............. {failed:,}\n\n"
+            "Data\n\n"
+            f"Copied ............. {format_bytes(tracker.completed_bytes)}\n\n"
+            f"Elapsed ............ {format_duration(tracker.elapsed)}\n"
+            f"Average speed ...... {format_bytes(round(tracker.average_bytes_per_second))}/s\n\n"
+            f"Destination ......... {destination}"
+        )
 
     def _destination(self, row: sqlite3.Row) -> Path:
         assert self.config.imports is not None
