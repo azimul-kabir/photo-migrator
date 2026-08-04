@@ -45,7 +45,44 @@ INFO Library indexing complete.
 
 Planning compares sizes first and hashes a candidate only when canonical files share its size.
 Exact matches record the canonical path and avoid a copy. Real runs are copy-only and verify size
-and SHA-256. The older commands remain the **legacy full-migration workflow**.
+and SHA-256. Import execution reports progress every 500 files or 30 seconds, whichever comes
+first, and resumes its counters from the latest interrupted run:
+
+```text
+INFO Import plan            : 7
+INFO Files to import        : 36,563
+INFO Existing duplicates    : 2
+INFO Destination reuse      : 0
+INFO Data to copy           : 207 GiB
+INFO
+INFO Destination            : /volume1/photo/CleanLibrary
+INFO
+INFO Phase 1/1: Importing files...
+INFO Phase 1/1 | Imported 12,500 / 36,563 files (34.2%) | 73.8 GiB / 207 GiB (35.6%) | 42.7 MiB/s | ETA 1h 07m | Current Camera Imports/Mobile Backup/azimul/iPhone/2025/04/IMG_3220.HEIC
+...
+INFO Import Summary
+==============
+
+Files
+
+Planned ............ 36,563
+Copied ............. 36,561
+Reused ............. 0
+Skipped ............ 2
+Failed ............. 0
+
+Data
+
+Copied ............. 207 GiB
+
+Elapsed ............ 2h 13m
+Average speed ...... 26.5 MiB/s
+
+Destination ......... /volume1/photo/CleanLibrary
+INFO Import complete.
+```
+
+The older commands remain the **legacy full-migration workflow**.
 
 The project lockfile is the deployment contract for Python 3.9–3.12. Use
 `uv sync --frozen --dev` for development or `uv sync --frozen` for runtime deployment. CI performs

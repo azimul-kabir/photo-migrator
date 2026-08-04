@@ -34,7 +34,7 @@ def format_duration(seconds: float, *, precise: bool = False) -> str:
     return f"{seconds}s" if precise else "<1m"
 
 
-def _flush_logger(logger: logging.Logger) -> None:
+def flush_logger(logger: logging.Logger) -> None:
     """Flush the handlers that can receive a record from *logger*."""
     current: logging.Logger | None = logger
     while current is not None:
@@ -58,6 +58,10 @@ class ProgressTracker:
     initial_items: int = 0
     initial_bytes: int = 0
     byte_based: bool = False
+    item_based_percentage: bool = False
+    item_noun: str = "canonical assets"
+    count_failures_as_completed: bool = False
+    current_item: str | None = None
     clock: Callable[[], float] = time.monotonic
     file_interval: int = 500
     time_interval: float = 30.0
@@ -84,7 +88,8 @@ class ProgressTracker:
 
     @property
     def completed_items(self) -> int:
-        return self.initial_items + self.succeeded
+        failures = self.failed if self.count_failures_as_completed else 0
+        return self.initial_items + self.succeeded + failures
 
     @property
     def completed_bytes(self) -> int:
@@ -122,21 +127,27 @@ class ProgressTracker:
         ):
             return
         self.logger.info(self.progress_message())
-        _flush_logger(self.logger)
+        flush_logger(self.logger)
         self._last_logged_files = self.attempted
         self._last_logged_at = now
 
     def progress_message(self) -> str:
         if self.byte_based:
             total_bytes = self.total_bytes or 0
-            percent = 100.0 * self.completed_bytes / total_bytes if total_bytes else 100.0
+            byte_percent = 100.0 * self.completed_bytes / total_bytes if total_bytes else 100.0
+            item_percent = (
+                100.0 * self.completed_items / self.total_items if self.total_items else 100.0
+            )
+            percent = item_percent if self.item_based_percentage else byte_percent
+            byte_percentage = f" ({byte_percent:.1f}%)" if self.item_based_percentage else ""
             eta = self.eta_seconds
             eta_text = format_duration(eta) if eta is not None else "calculating"
+            current = f" | Current {self.current_item}" if self.current_item else ""
             return (
                 f"{self.phase} | {self.verb} {self.completed_items:,} / {self.total_items:,} "
-                f"canonical assets ({percent:.1f}%) | {format_bytes(self.completed_bytes)} / "
-                f"{format_bytes(total_bytes)} | "
-                f"{format_bytes(round(self.average_bytes_per_second))}/s | ETA {eta_text}"
+                f"{self.item_noun} ({percent:.1f}%) | {format_bytes(self.completed_bytes)} / "
+                f"{format_bytes(total_bytes)}{byte_percentage} | "
+                f"{format_bytes(round(self.average_bytes_per_second))}/s | ETA {eta_text}{current}"
             )
         percent = 100.0 * self.attempted / self.total_items if self.total_items else 100.0
         return (
