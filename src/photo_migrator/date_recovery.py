@@ -15,6 +15,7 @@ from typing import Any
 
 from photo_migrator.config import MetadataDateRecoveryConfig
 from photo_migrator.database import Database, utc_now
+from photo_migrator.filesystem_safety import sha256_file
 from photo_migrator.image_metadata import ImageAnalyzer, normalize_timestamp
 
 WRITE_EXTENSIONS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
@@ -656,6 +657,11 @@ class DateRecovery:
         preserve_times: bool = True,
         limit: int | None = None,
     ) -> int:
+        plan = self.database.connection.execute(
+            "SELECT status FROM metadata_date_plans WHERE id=?", (plan_id,)
+        ).fetchone()
+        if plan is None or plan["status"] != "ready":
+            raise ValueError("metadata date plan is not ready")
         with self.database.transaction() as c:
             run_id = c.execute(
                 "INSERT INTO metadata_date_apply_runs(plan_id,started_at,dry_run,status) VALUES(?,?,?,'running')",
@@ -710,6 +716,7 @@ class DateRecovery:
                     )
                     if verified_dt != expected_dt:
                         raise RuntimeError(f"verification failed: observed {verified!r}")
+                    self._refresh_asset_identity(int(item["asset_id"]), path)
                     status = "completed"
             except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 status, error = "skipped", str(exc)
@@ -802,6 +809,19 @@ class DateRecovery:
                     result = subprocess.run(args, capture_output=True, text=True, check=False)
                     if result.returncode:
                         raise RuntimeError(result.stderr.strip())
+                    restored = self.tool.read(path)
+                    restored_value, _, _ = capture_value(restored, self.policy)
+                    if restored_value is not None:
+                        raise RuntimeError(
+                            f"rollback verification failed: observed {restored_value!r}"
+                        )
+                    plan_item = self.database.connection.execute(
+                        "SELECT asset_id FROM metadata_date_plan_items WHERE id=?",
+                        (item["plan_item_id"],),
+                    ).fetchone()
+                    if plan_item is None:
+                        raise RuntimeError("rollback plan item no longer exists")
+                    self._refresh_asset_identity(int(plan_item["asset_id"]), path)
                     status = "completed"
                 report.append(
                     {
@@ -830,6 +850,49 @@ class DateRecovery:
             )
         self._csv(f"metadata-date-rollback-{run}.csv", report)
         return int(run)
+
+    def _refresh_asset_identity(self, asset_id: int, path: Path) -> None:
+        """Atomically publish a verified metadata write's new on-disk identity."""
+        before = path.stat()
+        digest, size = sha256_file(path)
+        after = path.stat()
+        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise RuntimeError("file changed while refreshing canonical identity")
+        if size != after.st_size:
+            raise RuntimeError("file size changed while refreshing canonical identity")
+
+        now = utc_now()
+        with self.database.transaction() as connection:
+            connection.execute(
+                """UPDATE assets SET size_bytes=?,mtime_ns=?,sha256=?,
+                hash_algorithm='sha256',hash_status='completed',hash_started_at=NULL,
+                hash_completed_at=?,hash_error=NULL,updated_at=?,analysis_status='pending',
+                analysis_started_at=NULL,analysis_completed_at=NULL,analysis_error=NULL,
+                analyzed_size_bytes=NULL,analyzed_mtime_ns=NULL,relationship_status='pending',
+                relationship_error=NULL,relationship_analyzed_size_bytes=NULL,
+                relationship_analyzed_mtime_ns=NULL WHERE id=? AND absolute_path=?""",
+                (size, after.st_mtime_ns, digest, now, now, asset_id, str(path)),
+            )
+            if connection.execute("SELECT changes()").fetchone()[0] != 1:
+                raise RuntimeError("canonical asset no longer matches metadata plan")
+            connection.execute(
+                """UPDATE import_plans SET status='stale' WHERE status='ready' AND id IN
+                (SELECT plan_id FROM import_plan_items WHERE canonical_asset_id=?)""",
+                (asset_id,),
+            )
+            connection.execute(
+                """UPDATE migration_plans SET status='superseded',updated_at=?
+                WHERE status!='superseded' AND id IN
+                (SELECT i.plan_id FROM migration_plan_items i
+                 JOIN migration_plan_item_assets a ON a.plan_item_id=i.id
+                 WHERE a.asset_id=?)""",
+                (now, asset_id),
+            )
+            connection.execute(
+                """UPDATE metadata_date_plans SET status='stale' WHERE status='ready' AND scan_run_id IN
+                (SELECT scan_run_id FROM metadata_date_evidence WHERE asset_id=?)""",
+                (asset_id,),
+            )
 
     def _report(
         self,
