@@ -13,6 +13,7 @@ from photo_migrator.analysis import AnalysisEngine
 from photo_migrator.builder import Builder, Rollback
 from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
+from photo_migrator.date_recovery import DateRecovery
 from photo_migrator.db_tools import backup_database, check_database
 from photo_migrator.doctor import run_doctor
 from photo_migrator.hashing import HashEngine
@@ -150,6 +151,43 @@ def build_parser() -> argparse.ArgumentParser:
     import_run.add_argument("--plan-id", type=int, required=True)
     import_run.add_argument("--dry-run", action="store_true")
     import_run.add_argument("--confirm", action="store_true")
+    metadata_scan = subparsers.add_parser(
+        "metadata-date-scan", help="collect capture-date evidence without modifying media"
+    )
+    metadata_scan.add_argument("--database", type=Path, required=True)
+    metadata_scan.add_argument("--config", type=Path, required=True)
+    metadata_scan.add_argument("--root", type=Path)
+    metadata_scan.add_argument("--report-dir", type=Path, required=True)
+    metadata_scan.add_argument("--limit", type=int)
+    metadata_plan = subparsers.add_parser(
+        "metadata-date-plan", help="create a conservative recovery plan"
+    )
+    metadata_plan.add_argument("--database", type=Path, required=True)
+    metadata_plan.add_argument("--config", type=Path, required=True)
+    metadata_plan.add_argument("--scan-run-id", type=int)
+    metadata_plan.add_argument("--min-confidence", type=int)
+    metadata_plan.add_argument("--allow-estimated-dates", action="store_true", default=None)
+    metadata_plan.add_argument("--report-dir", type=Path, required=True)
+    metadata_apply = subparsers.add_parser(
+        "metadata-date-apply", help="preview or explicitly apply a recovery plan"
+    )
+    metadata_apply.add_argument("--database", type=Path, required=True)
+    metadata_apply.add_argument("--config", type=Path, required=True)
+    metadata_apply.add_argument("--plan-id", type=int, required=True)
+    metadata_apply.add_argument("--report-dir", type=Path, required=True)
+    metadata_apply.add_argument("--limit", type=int)
+    metadata_apply.add_argument(
+        "--apply", action="store_true", help="explicitly permit metadata writes"
+    )
+    metadata_apply.add_argument("--no-preserve-filesystem-times", action="store_true")
+    metadata_rollback = subparsers.add_parser(
+        "metadata-date-rollback", help="preview or roll back one metadata apply run"
+    )
+    metadata_rollback.add_argument("--database", type=Path, required=True)
+    metadata_rollback.add_argument("--config", type=Path, required=True)
+    metadata_rollback.add_argument("--run-id", type=int, required=True)
+    metadata_rollback.add_argument("--report-dir", type=Path, required=True)
+    metadata_rollback.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -157,6 +195,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging(args.log_level, args.log_format, args.log_file)
     try:
+        if args.command.startswith("metadata-date-"):
+            config = load_config(args.config)
+            with Database(args.database) as database:
+                database.initialize()
+                recovery = DateRecovery(database, config.metadata_date_recovery, args.report_dir)
+                if args.command == "metadata-date-scan":
+                    root = args.root or (config.library.root if config.library else None)
+                    if root is None:
+                        raise ConfigError("metadata-date-scan requires --root or library.root")
+                    run_id = recovery.scan(root, args.limit)
+                elif args.command == "metadata-date-plan":
+                    run_id = recovery.plan(
+                        args.scan_run_id, args.min_confidence, args.allow_estimated_dates
+                    )
+                elif args.command == "metadata-date-apply":
+                    run_id = recovery.apply(
+                        args.plan_id, args.apply, not args.no_preserve_filesystem_times, args.limit
+                    )
+                else:
+                    run_id = recovery.rollback(args.run_id, args.apply)
+            print(
+                f"{args.command} run {run_id} complete ({'APPLY' if getattr(args, 'apply', False) else 'dry run/read only'})"
+            )
+            return 0
         if args.command == "doctor":
             diagnostic, code = run_doctor(
                 args.database,

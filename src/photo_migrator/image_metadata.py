@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from collections.abc import Iterable
 from datetime import datetime
 from fractions import Fraction
@@ -52,7 +53,9 @@ def normalize_timestamp(value: object) -> str | None:
     raw = _text(value)
     if not raw:
         return None
-    candidates = (raw, raw.replace("Z", "+00:00"))
+    # EXIF uses colons in the date portion; ISO parsing preserves optional fractions/offsets.
+    exif_iso = re.sub(r"^(\d{4}):(\d{2}):(\d{2})", r"\1-\2-\3", raw)
+    candidates = (raw, raw.replace("Z", "+00:00"), exif_iso.replace("Z", "+00:00"))
     for candidate in candidates:
         try:
             if len(candidate) >= 10 and candidate[4] == ":" and candidate[7] == ":":

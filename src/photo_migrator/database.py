@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def utc_now() -> str:
@@ -228,6 +228,48 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_build_items_status ON build_items(status);
                 CREATE INDEX IF NOT EXISTS idx_build_items_destination ON build_items(destination_absolute_path);
                 CREATE INDEX IF NOT EXISTS idx_build_items_owned ON build_items(owned_by_build);
+                CREATE TABLE IF NOT EXISTS metadata_date_scan_runs (
+                    id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, finished_at TEXT,
+                    root TEXT NOT NULL, configuration TEXT NOT NULL, tool_version TEXT,
+                    status TEXT NOT NULL, scanned INTEGER NOT NULL DEFAULT 0,
+                    already_dated INTEGER NOT NULL DEFAULT 0, missing INTEGER NOT NULL DEFAULT 0,
+                    conflicts INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS metadata_date_evidence (
+                    id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES metadata_date_scan_runs(id),
+                    asset_id INTEGER NOT NULL REFERENCES assets(id), evidence_type TEXT NOT NULL,
+                    source TEXT, candidate_timestamp TEXT NOT NULL, timezone TEXT,
+                    precision TEXT NOT NULL, derivation TEXT NOT NULL, confidence INTEGER NOT NULL,
+                    raw_value TEXT, explanation TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_metadata_evidence_asset ON metadata_date_evidence(scan_run_id,asset_id);
+                CREATE TABLE IF NOT EXISTS metadata_date_plans (
+                    id INTEGER PRIMARY KEY, scan_run_id INTEGER NOT NULL REFERENCES metadata_date_scan_runs(id),
+                    created_at TEXT NOT NULL, min_confidence INTEGER NOT NULL,
+                    allow_estimated INTEGER NOT NULL, status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS metadata_date_plan_items (
+                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES metadata_date_plans(id),
+                    asset_id INTEGER NOT NULL REFERENCES assets(id), path TEXT NOT NULL,
+                    proposed_timestamp TEXT, precision TEXT, derivation TEXT, confidence INTEGER,
+                    status TEXT NOT NULL, selected_evidence TEXT, conflicts TEXT,
+                    planned_size INTEGER NOT NULL, planned_mtime_ns INTEGER NOT NULL,
+                    planned_sha256 TEXT, write_supported INTEGER NOT NULL,
+                    UNIQUE(plan_id,asset_id)
+                );
+                CREATE TABLE IF NOT EXISTS metadata_date_apply_runs (
+                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES metadata_date_plans(id),
+                    started_at TEXT NOT NULL, finished_at TEXT, dry_run INTEGER NOT NULL,
+                    rollback_of INTEGER REFERENCES metadata_date_apply_runs(id), status TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS metadata_date_apply_items (
+                    id INTEGER PRIMARY KEY, apply_run_id INTEGER NOT NULL REFERENCES metadata_date_apply_runs(id),
+                    plan_item_id INTEGER NOT NULL REFERENCES metadata_date_plan_items(id), path TEXT NOT NULL,
+                    before_values TEXT NOT NULL, intended_values TEXT NOT NULL, after_values TEXT,
+                    before_size INTEGER, before_mtime_ns INTEGER, after_size INTEGER, after_mtime_ns INTEGER,
+                    status TEXT NOT NULL, verification TEXT, error TEXT, backup TEXT NOT NULL,
+                    UNIQUE(apply_run_id,plan_item_id)
+                );
                 """
             )
             columns = {

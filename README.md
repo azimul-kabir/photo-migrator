@@ -372,3 +372,60 @@ uv run photo-migrator recover --database photo.db --json
 Global `--log-level DEBUG|INFO|WARNING|ERROR`, `--log-format text|json`, and `--log-file PATH` options provide diagnostics. JSON records contain timestamps, severity, logger and message, plus operation context when available. Exit codes are 0 success, 1 warnings/partial audit findings, 2 validation or safety failure, and 130 user interruption.
 
 Read the [Synology guide](docs/synology.md) and [safe first-run runbook](docs/first-run.md). Production use must begin with a small test source and copy mode. Do not delete sources until independent verification and backup exist. Photo Migrator cannot protect against disk failure, RAID is not a backup, and Photo Migrator does not manage Immich or its API yet. This is a pre-1.0 release: retain sources and independently inspect all reports.
+
+## Capture-date recovery
+
+The metadata date workflow is separate from migration. It inventories canonical still images,
+records evidence in SQLite, creates reviewable CSV plans, and only then permits an explicit write.
+Scan, plan, apply preview, and rollback preview are non-writing operations. A real write requires
+`--apply`; an existing valid capture date, a file changed after planning, conflicting evidence,
+weak filesystem-only evidence, an estimate not explicitly enabled, or an unsafe format blocks it.
+
+Evidence has deterministic confidence: trusted XMP/Google sidecars and exact SHA-256 counterparts
+99, same-stem RAW/JPEG pairs 98, strict full filename timestamps 95, two-sided interpolation 93,
+date-only filenames 90, exact-date folders 88, month folders 70, year folders 60, birth time 55,
+and modification time 40. Independent agreement adds at most four points (cap 99); strong
+disagreement is always manual review. Precision and derivation are retained. Partial folder dates
+use documented noon placeholders only when estimated dates are explicitly enabled.
+
+ExifTool is required for writes and is invoked without a shell. Embedded writes are conservatively
+limited to JPEG, TIFF, and PNG in this release; HEIC/HEIF and RAW files are read/reported where the
+installed tools support them but are never written. Videos and sidecar creation are excluded.
+Before every write the size and nanosecond mtime are checked and metadata is re-read. Afterwards the
+date is re-read for verification and the original filesystem mtime is restored by default. Relevant
+before-values are retained in SQLite for run-scoped rollback. Metadata writes necessarily alter file
+bytes and hashes, and inferred dates are evidence-based proposals—not guaranteed historical truth.
+
+Recommended first run (use one or two workers for a DS220+; writing is currently serialized):
+
+```bash
+# 1. Reconcile/hash CleanLibrary, then collect evidence only.
+photo-migrator library-index --database photo.db --config config.toml
+photo-migrator metadata-date-scan --database photo.db --config config.toml \
+  --report-dir reports/metadata-dates
+
+# 2. Review the full scan CSV. No media has changed.
+photo-migrator metadata-date-plan --database photo.db --config config.toml \
+  --min-confidence 95 --report-dir reports/metadata-dates
+
+# 3. Preview, then explicitly apply the reviewed plan ID.
+photo-migrator metadata-date-apply --database photo.db --config config.toml \
+  --plan-id 1 --report-dir reports/metadata-dates
+photo-migrator metadata-date-apply --database photo.db --config config.toml \
+  --plan-id 1 --report-dir reports/metadata-dates --apply
+
+# 4. Preview rollback (add --apply only after reviewing the rollback report).
+photo-migrator metadata-date-rollback --database photo.db --config config.toml \
+  --run-id 2 --report-dir reports/metadata-dates
+```
+
+Reports include a full scan, high-confidence plan, manual-review list, apply results, and rollback
+results. CSV output uses RFC-compatible quoting for commas, quotes, Unicode, and embedded newlines.
+Runs and item-level evidence, file snapshots, backups, outcomes, and errors remain auditable in the
+`metadata_date_*` SQLite tables. Re-running scan/plan creates a new immutable audit run; interrupted
+applications retain completed items and can be safely reviewed before a new run.
+
+Photo Migrator never calls Immich. After verified changes, use Immich's administration UI to rescan
+the external library and run the metadata extraction/refresh job for existing assets. A filesystem
+scan alone may not refresh metadata already stored by Immich; consult the documentation for the
+installed Immich version.

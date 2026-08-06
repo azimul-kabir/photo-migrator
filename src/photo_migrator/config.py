@@ -65,12 +65,28 @@ class PlanningConfig:
 
 
 @dataclass(frozen=True)
+class MetadataDateRecoveryConfig:
+    """Conservative capture-date recovery policy."""
+
+    min_confidence: int = 95
+    allow_partial_dates: bool = False
+    allow_estimated_dates: bool = False
+    preserve_filesystem_times: bool = True
+    max_neighbor_sequence_gap: int = 5
+    max_neighbor_time_gap_hours: int = 24
+    reasonable_year_min: int = 1980
+    reasonable_year_max: int | None = None
+    workers: int = 1
+
+
+@dataclass(frozen=True)
 class Config:
     sources: tuple[SourceConfig, ...]
     scan: ScanConfig
     planning: PlanningConfig | None = None
     library: LibraryConfig | None = None
     imports: ImportsConfig | None = None
+    metadata_date_recovery: MetadataDateRecoveryConfig = MetadataDateRecoveryConfig()
 
 
 SUPPORTED_TEMPLATE_FIELDS = frozenset(
@@ -258,6 +274,35 @@ def load_config(path: Path) -> Config:
             default, bool(raw_imports.get("preserve_source_subdirectories", False)), mapped
         )
 
+    recovery_raw = raw.get("metadata_date_recovery", {})
+    if not isinstance(recovery_raw, dict):
+        raise ConfigError("metadata_date_recovery must be a table")
+    defaults = MetadataDateRecoveryConfig()
+    recovery_values: dict[str, Any] = {}
+    for field in defaults.__dataclass_fields__:
+        recovery_values[field] = recovery_raw.get(field, getattr(defaults, field))
+    for field in ("allow_partial_dates", "allow_estimated_dates", "preserve_filesystem_times"):
+        if not isinstance(recovery_values[field], bool):
+            raise ConfigError(f"metadata_date_recovery.{field} must be boolean")
+    for field in (
+        "min_confidence",
+        "max_neighbor_sequence_gap",
+        "max_neighbor_time_gap_hours",
+        "reasonable_year_min",
+        "workers",
+    ):
+        if (
+            not isinstance(recovery_values[field], int)
+            or isinstance(recovery_values[field], bool)
+            or recovery_values[field] < 1
+        ):
+            raise ConfigError(f"metadata_date_recovery.{field} must be a positive integer")
+    year_max = recovery_values["reasonable_year_max"]
+    if year_max is not None and (not isinstance(year_max, int) or isinstance(year_max, bool)):
+        raise ConfigError("metadata_date_recovery.reasonable_year_max must be an integer")
+    if recovery_values["min_confidence"] > 100:
+        raise ConfigError("metadata_date_recovery.min_confidence must be at most 100")
+
     return Config(
         sources=tuple(sources),
         scan=ScanConfig(
@@ -279,6 +324,7 @@ def load_config(path: Path) -> Config:
         planning=_planning(raw.get("planning"), sources),
         library=library,
         imports=imports,
+        metadata_date_recovery=MetadataDateRecoveryConfig(**recovery_values),
     )
 
 
