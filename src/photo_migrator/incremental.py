@@ -344,6 +344,8 @@ class IncrementalImporter:
         ).fetchone()
         if plan is None or Path(plan["library_root"]) != root:
             raise ValueError("unknown plan or configured library differs from plan snapshot")
+        if plan["status"] != "ready":
+            raise ValueError("import plan is not ready; regenerate it from current inventory")
         prior = self.database.connection.execute(
             "SELECT * FROM import_runs WHERE plan_id=? AND dry_run=? ORDER BY id DESC LIMIT 1",
             (plan_id, int(dry_run)),
