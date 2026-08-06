@@ -48,3 +48,14 @@ MobileBackup = 100
 Originals = 80
 [library]
 root = "/volume1/photo/CleanLibrary"
+
+[metadata_date_recovery]
+min_confidence = 95
+allow_partial_dates = false
+allow_estimated_dates = false
+preserve_filesystem_times = true
+max_neighbor_sequence_gap = 5
+max_neighbor_time_gap_hours = 24
+reasonable_year_min = 1980
+# reasonable_year_max defaults dynamically to the current year
+workers = 1
