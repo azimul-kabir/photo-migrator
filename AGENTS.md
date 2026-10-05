@@ -28,7 +28,9 @@ Photo Migrator consolidates overlapping photo and video archives into one verifi
 ## Out of scope for the first milestone
 - Deleting originals
 - Near-duplicate or perceptual matching
-- Editing EXIF metadata
+- Editing EXIF metadata, except opt-in capture-date recovery (`metadata-date-apply --apply`),
+  which writes only canonical-library files and first keeps a verified byte backup of each
+  original for rollback
 - Importing through the Immich API
 - Parsing macOS Photos library databases
 

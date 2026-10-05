@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -15,8 +17,10 @@ from typing import Any
 
 from photo_migrator.config import MetadataDateRecoveryConfig
 from photo_migrator.database import Database, utc_now
-from photo_migrator.filesystem_safety import sha256_file
+from photo_migrator.filesystem_safety import fsync_directory, sha256_file
 from photo_migrator.image_metadata import ImageAnalyzer, normalize_timestamp
+
+LOGGER = logging.getLogger(__name__)
 
 WRITE_EXTENSIONS = {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
 STILL_EXTENSIONS = WRITE_EXTENSIONS | {".heic", ".heif", ".nef", ".cr2", ".cr3", ".arw", ".dng"}
@@ -339,6 +343,28 @@ def neighboring_evidence(
         "two-sided chronological sequence interpolation",
         "interpolated",
     )
+
+
+def _copy_verified(source: Path, destination: Path) -> str:
+    """Copy through a same-directory temporary, fsync, re-read, and return the SHA-256."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.partial")
+    digest = hashlib.sha256()
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with source.open("rb") as incoming, os.fdopen(descriptor, "wb") as outgoing:
+            while chunk := incoming.read(1024 * 1024):
+                outgoing.write(chunk)
+                digest.update(chunk)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        if sha256_file(temporary)[0] != digest.hexdigest():
+            raise RuntimeError(f"copy of {source} did not verify")
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    fsync_directory(destination.parent)
+    return digest.hexdigest()
 
 
 class DateRecovery:
@@ -682,6 +708,8 @@ class DateRecovery:
             status = "dry_run"
             error = ""
             after = None
+            backup: tuple[Path, str] | None = None
+            after_digest: str | None = None
             try:
                 stat = path.stat()
                 if (
@@ -694,6 +722,7 @@ class DateRecovery:
                 if existing:
                     raise RuntimeError("valid capture metadata appeared since plan")
                 if apply:
+                    backup = self._backup_original(int(run_id), item, path)
                     comment = None
                     if item["derivation"] == "estimated":
                         comment = f"Estimated capture date by photo-migrator. Original precision: {item['precision']}. Recovery run: {run_id}."
@@ -717,13 +746,23 @@ class DateRecovery:
                     if verified_dt != expected_dt:
                         raise RuntimeError(f"verification failed: observed {verified!r}")
                     self._refresh_asset_identity(int(item["asset_id"]), path)
+                    after_digest = sha256_file(path)[0]
                     status = "completed"
             except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 status, error = "skipped", str(exc)
+                if backup is not None:
+                    status, after_digest = self._classify_failed_write(item, path, backup[1])
+            if status == "write_unverified":
+                LOGGER.error(
+                    "metadata write to %s could not be verified; original kept at %s (%s)",
+                    path,
+                    backup[0] if backup else "",
+                    error,
+                )
             current = path.stat() if path.exists() else None
             with self.database.transaction() as c:
                 c.execute(
-                    "INSERT INTO metadata_date_apply_items(apply_run_id,plan_item_id,path,before_values,intended_values,after_values,before_size,before_mtime_ns,after_size,after_mtime_ns,status,verification,error,backup) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO metadata_date_apply_items(apply_run_id,plan_item_id,path,before_values,intended_values,after_values,before_size,before_mtime_ns,after_size,after_mtime_ns,status,verification,error,backup,backup_path,backup_sha256,after_sha256) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         run_id,
                         item["id"],
@@ -743,6 +782,9 @@ class DateRecovery:
                             default=str,
                             sort_keys=True,
                         ),
+                        str(backup[0]) if backup else None,
+                        backup[1] if backup else None,
+                        after_digest,
                     ),
                 )
             report.append(
@@ -779,7 +821,7 @@ class DateRecovery:
             ).lastrowid
         assert run is not None
         items = self.database.connection.execute(
-            "SELECT i.*,p.proposed_timestamp FROM metadata_date_apply_items i JOIN metadata_date_plan_items p ON p.id=i.plan_item_id WHERE i.apply_run_id=? AND i.status='completed' ORDER BY i.path",
+            "SELECT i.*,p.proposed_timestamp FROM metadata_date_apply_items i JOIN metadata_date_plan_items p ON p.id=i.plan_item_id WHERE i.apply_run_id=? AND i.status IN ('completed','write_unverified') ORDER BY i.path",
             (apply_run_id,),
         ).fetchall()
         report = []
@@ -788,11 +830,30 @@ class DateRecovery:
             status = "dry_run"
             error = ""
             try:
+                backup = json.loads(item["backup"])
+                if item["backup_path"]:
+                    # Byte-level restore: exact original content and mtime.
+                    self._check_restorable(item, path)
+                    if apply:
+                        self._restore_original(item, path)
+                        self._refresh_asset_identity(self._asset_id(item), path)
+                        status = "completed"
+                    report.append(
+                        {
+                            "path": str(path),
+                            "status": status,
+                            "restored": f"original bytes from {item['backup_path']}",
+                            "error": "",
+                            "run_id": run,
+                        }
+                    )
+                    continue
+                if item["status"] != "completed":
+                    raise RuntimeError("unverified write has no byte backup to restore")
                 current = self.tool.read(path)
                 value, _, _ = capture_value(current, self.policy)
                 if value != item["proposed_timestamp"]:
                     raise RuntimeError("current capture date differs from value written by run")
-                backup = json.loads(item["backup"])
                 if apply:
                     # This first version only writes previously-empty fields, so rollback removes exactly them.
                     args = [
@@ -815,13 +876,7 @@ class DateRecovery:
                         raise RuntimeError(
                             f"rollback verification failed: observed {restored_value!r}"
                         )
-                    plan_item = self.database.connection.execute(
-                        "SELECT asset_id FROM metadata_date_plan_items WHERE id=?",
-                        (item["plan_item_id"],),
-                    ).fetchone()
-                    if plan_item is None:
-                        raise RuntimeError("rollback plan item no longer exists")
-                    self._refresh_asset_identity(int(plan_item["asset_id"]), path)
+                    self._refresh_asset_identity(self._asset_id(item), path)
                     status = "completed"
                 report.append(
                     {
@@ -850,6 +905,64 @@ class DateRecovery:
             )
         self._csv(f"metadata-date-rollback-{run}.csv", report)
         return int(run)
+
+    def _asset_id(self, item: Any) -> int:
+        plan_item = self.database.connection.execute(
+            "SELECT asset_id FROM metadata_date_plan_items WHERE id=?", (item["plan_item_id"],)
+        ).fetchone()
+        if plan_item is None:
+            raise RuntimeError("rollback plan item no longer exists")
+        return int(plan_item["asset_id"])
+
+    def _backup_original(self, run_id: int, item: Any, path: Path) -> tuple[Path, str]:
+        """Keep a verified byte copy of *path* before ExifTool rewrites it in place."""
+        directory = self.report_dir / "metadata-backups" / f"apply-{run_id}"
+        backup = directory / f"{int(item['asset_id']):08d}{path.suffix.lower()}"
+        digest = _copy_verified(path, backup)
+        if item["planned_sha256"] and digest != item["planned_sha256"]:
+            backup.unlink()
+            raise RuntimeError("file content changed since plan")
+        return backup, digest
+
+    def _classify_failed_write(
+        self, item: Any, path: Path, original_digest: str
+    ) -> tuple[str, str | None]:
+        """After an error, tell an untouched file apart from one ExifTool already changed."""
+        try:
+            current = sha256_file(path)[0]
+        except OSError:
+            return "write_unverified", None
+        if current == original_digest:
+            return "skipped", None
+        try:
+            self._refresh_asset_identity(int(item["asset_id"]), path)
+        except (OSError, RuntimeError) as exc:
+            LOGGER.error("could not refresh inventory for %s: %s", path, exc)
+        return "write_unverified", current
+
+    @staticmethod
+    def _check_restorable(item: Any, path: Path) -> None:
+        backup = Path(item["backup_path"])
+        if sha256_file(backup)[0] != item["backup_sha256"]:
+            raise RuntimeError(f"backup {backup} no longer matches its recorded SHA-256")
+        if item["after_sha256"] is None or sha256_file(path)[0] != item["after_sha256"]:
+            raise RuntimeError("file changed after the apply run; not restoring")
+
+    @staticmethod
+    def _restore_original(item: Any, path: Path) -> None:
+        current = path.stat()
+        temporary = path.parent / f".photo-migrator-restore-{int(item['id'])}.tmp"
+        digest = _copy_verified(Path(item["backup_path"]), temporary)
+        try:
+            if digest != item["backup_sha256"]:
+                raise RuntimeError("backup changed while restoring")
+            os.utime(temporary, ns=(current.st_atime_ns, int(item["before_mtime_ns"])))
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        fsync_directory(path.parent)
+        if sha256_file(path)[0] != item["backup_sha256"]:
+            raise RuntimeError("restored file does not match backup")
 
     def _refresh_asset_identity(self, asset_id: int, path: Path) -> None:
         """Atomically publish a verified metadata write's new on-disk identity."""

@@ -396,12 +396,17 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_plan_items_bundle ON migration_plan_items(bundle_key);
                 """
             )
-            plan_columns = {row[1] for row in connection.execute("PRAGMA table_info(import_plans)")}
-            for name in ("internal_duplicate_count", "review_count"):
-                if name not in plan_columns:
-                    connection.execute(
-                        f"ALTER TABLE import_plans ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
-                    )
+            # Schema 8 additions to tables created by earlier versions.
+            for table, name, definition in (
+                ("import_plans", "internal_duplicate_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("import_plans", "review_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("metadata_date_apply_items", "backup_path", "TEXT"),
+                ("metadata_date_apply_items", "backup_sha256", "TEXT"),
+                ("metadata_date_apply_items", "after_sha256", "TEXT"),
+            ):
+                existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+                if name not in existing:
+                    connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
         self._widen_import_plan_actions()
 
     def _widen_import_plan_actions(self) -> None:

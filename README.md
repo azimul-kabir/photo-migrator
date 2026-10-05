@@ -422,6 +422,13 @@ date is re-read for verification and the original filesystem mtime is restored b
 before-values are retained in SQLite for run-scoped rollback. Metadata writes necessarily alter file
 bytes and hashes, and inferred dates are evidence-based proposals—not guaranteed historical truth.
 
+Before each real write the original file is copied to
+`<report-dir>/metadata-backups/apply-<run>/` and verified against the planned SHA-256, so plan for
+free space equal to the images being changed. Rollback restores those exact bytes and the original
+mtime, and only when the file still matches what the apply run wrote. A write that changed a file
+but failed verification is recorded as `write_unverified` (never silently skipped) and can be
+rolled back the same way. Keep the backup folder until you have checked the results.
+
 Recommended first run (use one or two workers for a DS220+; writing is currently serialized):
 
 ```bash
