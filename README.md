@@ -1,6 +1,61 @@
-# Photo Migrator
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/hero-dark.png">
+    <img src="docs/images/hero-light.png" width="100%"
+      alt="Photo Migrator's web interface importing 76 of 136 files, beside a summary of two sources whose 136 files were planned as 89 new, 33 already in the library and 14 duplicates">
+  </picture>
+</p>
 
-Photo Migrator is a safety-first utility for consolidating overlapping photo and video archives into one deduplicated, verified library suitable for Immich.
+<p align="center">
+  <b>A safety-first consolidation tool for photo backups on a Synology NAS or a Mac.</b><br>
+  Index the library you already have, then import only what is missing from your old phones,
+  laptops and backups.
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#web-interface">Web interface</a> ·
+  <a href="#choosing-a-workflow">Workflows</a> ·
+  <a href="docs/synology.md">Synology guide</a> ·
+  <a href="docs/first-run.md">Safe first run</a>
+</p>
+
+## Why Photo Migrator
+
+- **Exact duplicates only.** Files are compared by size, then SHA-256. Nothing is merged on a
+  guess, and Live Photo image and video halves stay separate files.
+- **Originals stay untouched.** Sources are only read. Imports copy through a temporary file and
+  are verified before and after they are placed.
+- **Your existing library stays as it is.** It is indexed in place and never reorganized; only
+  content it does not already have is copied in.
+- **One copy of every photo.** The same picture in three backups is imported once, from the source
+  you rank highest.
+- **Every decision is on record.** Plans, runs and errors live in SQLite and CSV reports, and an
+  interrupted run resumes where it stopped.
+- **Runs where your photos are.** A Synology NAS or a Mac, Python 3.9–3.13, from the command line
+  or a browser.
+
+## Quick start
+
+```bash
+git clone https://github.com/azimul-kabir/photo-migrator.git
+cd photo-migrator
+uv sync --frozen
+uv run photo-migrator gui --database ~/photo-migrator/photo.db --config ~/photo-migrator/config.toml
+```
+
+If the config file does not exist yet, the browser page asks for your library and source folders
+and creates it. Prefer the terminal? The same steps are:
+
+```bash
+uv run photo-migrator library-index --database photo.db --config config.toml
+uv run photo-migrator import-scan   --database photo.db --config config.toml
+uv run photo-migrator import-plan   --database photo.db --config config.toml
+uv run photo-migrator import-run    --database photo.db --config config.toml --plan-id 1 --dry-run
+uv run photo-migrator import-run    --database photo.db --config config.toml --plan-id 1 --confirm
+```
+
+Start with a small test copy of one source; [Safe first run](docs/first-run.md) walks through it.
 
 ## Choosing a workflow
 
@@ -44,6 +99,25 @@ behave identically. Safety rules:
 - Rollback and capture-date writes are deliberately CLI-only.
 - The server listens on `127.0.0.1`, requires the link's token for every API call, rejects
   unexpected `Host` headers, and sends a strict Content-Security-Policy.
+
+<p align="center">
+  <img src="docs/images/gui-plan-review.png" width="100%"
+    alt="Plan review: 89 new files, 33 already in the library, 14 duplicates in sources, with a table showing each OldLaptop copy and the MobileBackup file it duplicates">
+  <br><sub>Review the plan before anything is copied. Here, 14 photos on the old laptop are
+  duplicates of phone-backup photos, so only the higher-priority phone copy is imported.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/gui-setup.png" width="560"
+    alt="Setup form with a clean library folder, an import folder and two prioritized read-only sources">
+  <br><sub>First run: describe your folders and a configuration file is created for you.</sub>
+</p>
+
+<p align="center">
+  <img src="docs/images/gui-confirm.png" width="560"
+    alt="Confirmation dialog: copy 89 files (382.6 MiB) into /volume1/photo/CleanLibrary, with a required 'I reviewed the plan and the dry run' checkbox">
+  <br><sub>Import only unlocks after a dry run of the same plan, and still asks you to confirm.</sub>
+</p>
 
 On a headless NAS, start it there with `--no-browser` and reach it through an SSH tunnel, for
 example `ssh -L 8765:127.0.0.1:8765 user@nas`, then open the printed link locally.
