@@ -250,6 +250,16 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"library root is not a directory: {library_root}")
         if any(s.path == library_root or s.path.is_relative_to(library_root) for s in sources):
             raise ConfigError("candidate sources must be outside library.root")
+        excluded = set(_string_list(raw_scan.get("exclude_directory_names", []), "exclude"))
+        for source in sources:
+            # A source containing the library would rescan canonical files as candidates.
+            if library_root.is_relative_to(source.path) and not excluded.intersection(
+                library_root.relative_to(source.path).parts
+            ):
+                raise ConfigError(
+                    f"library.root is inside source {source.name}; add "
+                    f'"{library_root.name}" to scan.exclude_directory_names'
+                )
         library = LibraryConfig(library_root)
 
     imports = None
