@@ -56,7 +56,9 @@ class IncrementalImporter:
         return ProgressTracker(LOGGER, **settings)
 
     def library_index(self, workers: int = 1, resume: bool = False) -> ScanResult:
-        del workers  # hashing is deliberately serialized with SQLite writes
+        if workers != 1:
+            # Hashing is deliberately serialized with SQLite writes.
+            LOGGER.warning("library-index ignores --workers=%s and hashes serially", workers)
         root = _require(self.config)
         before = self.database.connection.execute(
             """SELECT COUNT(*) AS total_assets, COALESCE(SUM(size_bytes), 0) AS total_bytes,

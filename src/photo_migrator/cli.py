@@ -133,7 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     library_index.add_argument("--database", type=Path, required=True)
     library_index.add_argument("--config", type=Path, required=True)
-    library_index.add_argument("--workers", type=int, default=1)
+    library_index.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="accepted for compatibility; hashing is serialized with SQLite writes",
+    )
     index_mode = library_index.add_mutually_exclusive_group()
     index_mode.add_argument(
         "--resume", action="store_true", help="skip reconciliation and hash pending inventory"

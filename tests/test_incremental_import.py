@@ -305,3 +305,12 @@ def test_schema_upgrade_widens_import_plan_actions(tmp_path: Path) -> None:
             )
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_library_index_warns_that_workers_are_ignored(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    database, importer, _ = _setup(tmp_path, {"a": (1, {})})
+    with database:
+        importer.library_index(workers=4)
+    assert "ignores --workers=4" in caplog.text
