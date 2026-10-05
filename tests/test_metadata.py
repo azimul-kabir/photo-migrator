@@ -8,7 +8,7 @@ import pytest
 from PIL import Image
 
 from photo_migrator.analysis import AnalysisEngine
-from photo_migrator.database import Database, utc_now
+from photo_migrator.database import SCHEMA_VERSION, Database, utc_now
 from photo_migrator.image_metadata import ImageAnalyzer, gps_coordinate, normalize_timestamp
 from photo_migrator.metadata import AnalyzerResult, MediaMetadata
 from photo_migrator.video_metadata import VideoAnalyzer, parse_ffprobe, parse_frame_rate
@@ -236,5 +236,5 @@ def test_schema_upgrade_from_version_two(tmp_path: Path) -> None:
         assert {"analysis_status", "captured_at", "video_codec"} <= columns
         assert (
             database.connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
-            == 7
+            == SCHEMA_VERSION
         )

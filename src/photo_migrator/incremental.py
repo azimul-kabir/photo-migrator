@@ -8,7 +8,10 @@ import logging
 import os
 import sqlite3
 import stat
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, ConfigError, SourceConfig
@@ -20,6 +23,25 @@ from photo_migrator.scanner import Scanner, ScanResult
 LOGGER = logging.getLogger(__name__)
 
 
+def _claim_key(relative: Path) -> str:
+    """Compare planned destinations case-insensitively, as macOS and SMB shares do."""
+    return relative.as_posix().casefold()
+
+
+@dataclass
+class _PlanItem:
+    candidate: sqlite3.Row
+    action: str
+    reason: str
+    digest: str | None = None
+    relative: Path | None = None
+    match_id: int | None = None
+    match_path: str | None = None
+    collided: bool = False
+    unreadable: bool = False
+    keeper: _PlanItem | None = None
+
+
 def _require(config: Config) -> Path:
     if config.library is None:
         raise ConfigError("[library] root is required for incremental commands")
@@ -29,6 +51,9 @@ def _require(config: Config) -> Path:
 class IncrementalImporter:
     def __init__(self, database: Database, config: Config) -> None:
         self.database, self.config = database, config
+
+    def _tracker(self, **settings: Any) -> ProgressTracker:
+        return ProgressTracker(LOGGER, **settings)
 
     def library_index(self, workers: int = 1, resume: bool = False) -> ScanResult:
         del workers  # hashing is deliberately serialized with SQLite writes
@@ -256,84 +281,205 @@ class IncrementalImporter:
             sql += " LIMIT ?"
             params.append(limit)
         candidates = self.database.connection.execute(sql, params).fetchall()
+        unhashed = self.database.connection.execute(
+            """SELECT COUNT(*) FROM assets WHERE asset_role='canonical' AND scan_status='available'
+            AND (hash_status!='completed' OR sha256 IS NULL)"""
+        ).fetchone()[0]
+        if unhashed:
+            LOGGER.warning(
+                "%s canonical assets are not hashed; candidates of the same size are marked for "
+                "review. Run library-index (or library-index --resume) and re-plan to resolve them.",
+                f"{unhashed:,}",
+            )
         with self.database.transaction() as connection:
             cursor = connection.execute(
                 "INSERT INTO import_plans(created_at,status,library_root,source_filter,candidate_count) VALUES (?,'planning',?,?,?)",
                 (utc_now(), str(root), source, len(candidates)),
             )
             plan_id = int(cursor.lastrowid or 0)
-        new = duplicates = collisions = avoided = 0
-        for candidate in candidates:
-            canon = self.database.connection.execute(
-                "SELECT * FROM assets WHERE asset_role='canonical' AND scan_status='available' AND size_bytes=? ORDER BY absolute_path",
-                (candidate["size_bytes"],),
-            ).fetchall()
-            digest = None
-            match: sqlite3.Row | None = None
-            if canon:
-                digest, observed = sha256_file(Path(candidate["absolute_path"]))
-                if observed != candidate["size_bytes"]:
-                    raise ValueError(
-                        f"candidate changed during planning: {candidate['absolute_path']}"
-                    )
-                match = next((row for row in canon if row["sha256"] == digest), None)
-                with self.database.transaction() as connection:
-                    connection.execute(
-                        "UPDATE assets SET sha256=?,hash_algorithm='sha256',hash_status='completed',hash_completed_at=? WHERE id=?",
-                        (digest, utc_now(), candidate["id"]),
-                    )
-            if match is not None:
-                action, relative, reason = (
-                    "duplicate_existing",
-                    None,
-                    "same size and SHA-256 as canonical asset",
-                )
-                duplicates += 1
-                avoided += candidate["size_bytes"]
-            else:
-                action, relative, reason = (
-                    "new",
-                    self._destination(candidate),
-                    "content is not in canonical library",
-                )
-                relative, collided, reused = self._resolve_collision(
-                    root, relative, candidate, digest
-                )
-                collisions += int(collided)
-                if reused is not None:
-                    action, match, reason = (
-                        "reuse_destination",
-                        reused,
-                        "destination already contains identical content",
-                    )
-                    duplicates += 1
-                    avoided += candidate["size_bytes"]
-                else:
-                    new += 1
+        try:
+            items = self._plan_items(root, candidates)
+            counts = Counter(item.action for item in items)
+            avoided = sum(
+                int(item.candidate["size_bytes"])
+                for item in items
+                if item.action in {"duplicate_existing", "duplicate_candidate", "reuse_destination"}
+            )
             with self.database.transaction() as connection:
-                connection.execute(
+                connection.executemany(
                     """INSERT INTO import_plan_items(plan_id,candidate_asset_id,action,destination_relative_path,
                     canonical_asset_id,matching_canonical_path,expected_size_bytes,expected_sha256,reason)
                     VALUES (?,?,?,?,?,?,?,?,?)""",
                     (
-                        plan_id,
-                        candidate["id"],
-                        action,
-                        relative.as_posix() if relative else None,
-                        match["id"] if match else None,
-                        match["absolute_path"] if match else None,
-                        candidate["size_bytes"],
-                        digest,
-                        reason,
+                        (
+                            plan_id,
+                            item.candidate["id"],
+                            item.action,
+                            item.relative.as_posix() if item.relative else None,
+                            item.match_id,
+                            item.match_path,
+                            item.candidate["size_bytes"],
+                            item.digest,
+                            item.reason,
+                        )
+                        for item in items
                     ),
                 )
+                connection.execute(
+                    """UPDATE import_plans SET status='ready',new_count=?,duplicate_count=?,
+                    internal_duplicate_count=?,review_count=?,collision_count=?,bytes_avoided=?
+                    WHERE id=?""",
+                    (
+                        counts["new"],
+                        counts["duplicate_existing"] + counts["reuse_destination"],
+                        counts["duplicate_candidate"],
+                        counts["review"],
+                        sum(item.collided for item in items),
+                        avoided,
+                        plan_id,
+                    ),
+                )
+        except BaseException:
+            with self.database.transaction() as connection:
+                connection.execute("UPDATE import_plans SET status='failed' WHERE id=?", (plan_id,))
+            raise
+        self._plan_reports(plan_id)
+        LOGGER.info(
+            "Import plan %s: new=%s already_in_library=%s duplicates_within_sources=%s review=%s",
+            plan_id,
+            f"{counts['new']:,}",
+            f"{counts['duplicate_existing'] + counts['reuse_destination']:,}",
+            f"{counts['duplicate_candidate']:,}",
+            f"{counts['review']:,}",
+        )
+        return plan_id
+
+    def _plan_items(self, root: Path, candidates: list[sqlite3.Row]) -> list[_PlanItem]:
+        sizes = Counter(int(candidate["size_bytes"]) for candidate in candidates)
+        tracker = self._tracker(
+            phase_name="Planning import", total_items=len(candidates), verb="Compared"
+        )
+        # Pass 1: compare each candidate with the canonical library.
+        items: list[_PlanItem] = []
+        for candidate in candidates:
+            item = self._classify(candidate, sizes[int(candidate["size_bytes"])] > 1)
+            items.append(item)
+            if item.unreadable:
+                tracker.record_failure()
+            else:
+                tracker.record_success(int(candidate["size_bytes"]) if item.digest else 0)
+        # Pass 2: import one candidate per identical-content group, preferring source priority.
+        groups: dict[tuple[int, str], list[_PlanItem]] = {}
+        for item in items:
+            if item.action == "new" and item.digest is not None:
+                key = (int(item.candidate["size_bytes"]), item.digest)
+                groups.setdefault(key, []).append(item)
+        for members in groups.values():
+            keeper = min(members, key=lambda member: -int(member.candidate["source_priority"]))
+            for member in members:
+                if member is not keeper:
+                    member.action, member.keeper = "duplicate_candidate", keeper
+        # Pass 3: assign destinations in candidate order, reserving each one for this plan.
+        claimed: set[str] = set()
+        for item in items:
+            if item.action != "new":
+                continue
+            try:
+                relative, item.collided, reused, item.digest = self._resolve_collision(
+                    root, self._destination(item.candidate), item.candidate, item.digest, claimed
+                )
+            except (OSError, ValueError) as exc:
+                LOGGER.error(
+                    "import-plan could not plan a destination for %s: %s",
+                    item.candidate["absolute_path"],
+                    exc,
+                )
+                item.action, item.reason = "review", f"destination could not be planned: {exc}"
+                continue
+            if reused is not None:
+                item.action, item.reason = (
+                    "reuse_destination",
+                    "destination already contains identical content",
+                )
+                item.match_id, item.match_path = int(reused["id"]), str(reused["absolute_path"])
+            else:
+                item.relative = relative
+                claimed.add(_claim_key(relative))
+        # Identical candidates follow the outcome of the one being imported.
+        for item in items:
+            if item.keeper is None:
+                continue
+            keeper_path = item.keeper.candidate["absolute_path"]
+            if item.keeper.action == "new" and item.keeper.relative is not None:
+                item.match_path = str(root / item.keeper.relative)
+                item.reason = (
+                    f"same size and SHA-256 as candidate {keeper_path}, which this plan imports"
+                )
+            elif item.keeper.action == "reuse_destination":
+                item.match_id, item.match_path = item.keeper.match_id, item.keeper.match_path
+                item.reason = (
+                    f"same size and SHA-256 as candidate {keeper_path}, already in the library"
+                )
+            else:
+                item.action = "review"
+                item.reason = f"identical candidate {keeper_path} needs review"
+        return items
+
+    def _classify(self, candidate: sqlite3.Row, shares_size: bool) -> _PlanItem:
+        canon = self.database.connection.execute(
+            "SELECT * FROM assets WHERE asset_role='canonical' AND scan_status='available' AND size_bytes=? ORDER BY absolute_path",
+            (candidate["size_bytes"],),
+        ).fetchall()
+        if not canon and not shares_size:
+            return _PlanItem(candidate, "new", "content is not in canonical library")
+        try:
+            digest = self._hash_candidate(candidate)
+        except (OSError, ValueError) as exc:
+            LOGGER.error(
+                "import-plan could not hash candidate %s: %s", candidate["absolute_path"], exc
+            )
+            return _PlanItem(
+                candidate,
+                "review",
+                f"candidate could not be read during planning: {exc}",
+                unreadable=True,
+            )
+        match = next(
+            (row for row in canon if row["hash_status"] == "completed" and row["sha256"] == digest),
+            None,
+        )
+        if match is not None:
+            return _PlanItem(
+                candidate,
+                "duplicate_existing",
+                "same size and SHA-256 as canonical asset",
+                digest=digest,
+                match_id=int(match["id"]),
+                match_path=str(match["absolute_path"]),
+            )
+        if any(row["hash_status"] != "completed" or row["sha256"] is None for row in canon):
+            return _PlanItem(
+                candidate,
+                "review",
+                "a canonical asset of the same size is not hashed; run library-index and re-plan",
+                digest=digest,
+            )
+        return _PlanItem(candidate, "new", "content is not in canonical library", digest=digest)
+
+    def _hash_candidate(self, candidate: sqlite3.Row) -> str:
+        path = Path(candidate["absolute_path"])
+        digest, observed = sha256_file(path)
+        info = path.lstat()
+        if observed != candidate["size_bytes"] or info.st_size != candidate["size_bytes"]:
+            raise ValueError("candidate size changed since import-scan; run import-scan again")
+        if candidate["mtime_ns"] is not None and info.st_mtime_ns != candidate["mtime_ns"]:
+            raise ValueError("candidate mtime changed since import-scan; run import-scan again")
         with self.database.transaction() as connection:
             connection.execute(
-                "UPDATE import_plans SET status='ready',new_count=?,duplicate_count=?,collision_count=?,bytes_avoided=? WHERE id=?",
-                (new, duplicates, collisions, avoided, plan_id),
+                "UPDATE assets SET sha256=?,hash_algorithm='sha256',hash_status='completed',hash_completed_at=? WHERE id=?",
+                (digest, utc_now(), candidate["id"]),
             )
-        self._plan_reports(plan_id)
-        return plan_id
+        return digest
 
     def run(self, plan_id: int, dry_run: bool, confirm: bool) -> int:
         if not dry_run and not confirm:
@@ -346,6 +492,18 @@ class IncrementalImporter:
             raise ValueError("unknown plan or configured library differs from plan snapshot")
         if plan["status"] != "ready":
             raise ValueError("import plan is not ready; regenerate it from current inventory")
+        if not dry_run:
+            latest_real = self.database.connection.execute(
+                "SELECT id,status FROM import_runs WHERE plan_id=? AND dry_run=0 ORDER BY id DESC LIMIT 1",
+                (plan_id,),
+            ).fetchone()
+            if latest_real is not None and latest_real["status"] == "completed":
+                LOGGER.info(
+                    "Import plan %s was already completed by run %s; nothing to import.",
+                    plan_id,
+                    latest_real["id"],
+                )
+                return int(latest_real["id"])
         prior = self.database.connection.execute(
             "SELECT * FROM import_runs WHERE plan_id=? AND dry_run=? ORDER BY id DESC LIMIT 1",
             (plan_id, int(dry_run)),
@@ -361,7 +519,8 @@ class IncrementalImporter:
                 run_id = int(cur.lastrowid or 0)
         action_totals = self.database.connection.execute(
             """SELECT COUNT(*) AS planned,
-            COALESCE(SUM(CASE WHEN action='duplicate_existing' THEN 1 ELSE 0 END),0) AS skipped,
+            COALESCE(SUM(CASE WHEN action IN ('duplicate_existing','duplicate_candidate') THEN 1 ELSE 0 END),0) AS skipped,
+            COALESCE(SUM(CASE WHEN action='review' THEN 1 ELSE 0 END),0) AS review,
             COALESCE(SUM(CASE WHEN action='reuse_destination' THEN 1 ELSE 0 END),0) AS reused,
             COALESCE(SUM(CASE WHEN action='new' THEN expected_size_bytes ELSE 0 END),0) AS bytes
             FROM import_plan_items WHERE plan_id=?""",
@@ -371,12 +530,14 @@ class IncrementalImporter:
         already_written = int(prior["bytes_written"]) if prior is not None else 0
         skipped = int(action_totals["skipped"])
         reused = int(action_totals["reused"])
+        review = int(action_totals["review"])
         total_planned = int(action_totals["planned"])
         total_bytes = int(action_totals["bytes"])
         LOGGER.info("Import plan            : %s", plan_id)
         LOGGER.info("Files to import        : %s", f"{total_planned:,}")
         LOGGER.info("Existing duplicates    : %s", f"{skipped:,}")
         LOGGER.info("Destination reuse      : %s", f"{reused:,}")
+        LOGGER.info("Needs review           : %s", f"{review:,}")
         LOGGER.info("Data to copy           : %s", format_bytes(total_bytes))
         LOGGER.info("")
         LOGGER.info("Destination            : %s", root)
@@ -396,7 +557,9 @@ class IncrementalImporter:
             """SELECT i.*,a.absolute_path,a.filename,a.extension,a.mtime_ns,a.source_name,a.relative_path
             FROM import_plan_items i JOIN assets a ON a.id=i.candidate_asset_id
             WHERE i.plan_id=? AND i.action='new' AND NOT EXISTS
-            (SELECT 1 FROM import_run_items r WHERE r.run_id=? AND r.plan_item_id=i.id AND r.status IN ('copied','dry_run'))
+            (SELECT 1 FROM import_run_items r JOIN import_runs u ON u.id=r.run_id WHERE r.plan_item_id=i.id
+                AND ((r.run_id=? AND r.status='dry_run')
+                    OR (u.dry_run=0 AND r.status IN ('copied','verified_existing'))))
             ORDER BY i.id""",
             (plan_id, run_id),
         ).fetchall()
@@ -405,7 +568,7 @@ class IncrementalImporter:
             phase_name="Importing files",
             total_items=total_planned,
             total_bytes=total_bytes,
-            initial_items=skipped + reused + already_copied,
+            initial_items=skipped + reused + review + already_copied,
             initial_bytes=already_written,
             phase="Phase 1/1",
             verb="Imported",
@@ -414,12 +577,18 @@ class IncrementalImporter:
             item_noun="files",
             count_failures_as_completed=True,
         )
-        copied = failed = written = 0
         for row in rows:
-            destination = safe_destination(root, Path(row["destination_relative_path"]))
+            destination = root / str(row["destination_relative_path"])
             tracker.current_item = str(row["destination_relative_path"])
             try:
-                if dry_run:
+                destination = safe_destination(root, Path(row["destination_relative_path"]))
+                existing = None if dry_run else self._existing_copy(row, destination)
+                if existing is not None:
+                    # A previous attempt placed this file but stopped before recording it.
+                    digest, size = existing
+                    status, owned = "verified_existing", 0
+                    self._index_created(destination, row, digest, size)
+                elif dry_run:
                     status, digest, size, owned = (
                         "dry_run",
                         row["expected_sha256"],
@@ -431,32 +600,41 @@ class IncrementalImporter:
                         Path(row["absolute_path"]), destination, root, run_id, row["id"]
                     )
                     status, owned = "copied", 1
-                    copied += 1
-                    written += size
                     self._index_created(destination, row, digest, size)
                 with self.database.transaction() as connection:
                     connection.execute(
                         "INSERT OR REPLACE INTO import_run_items(run_id,plan_item_id,status,destination_path,sha256,size_bytes,owned,error) VALUES (?,?,?,?,?,?,?,NULL)",
                         (run_id, row["id"], status, str(destination), digest, size, owned),
                     )
-                tracker.record_success(size if not dry_run else 0)
+                tracker.record_success(size if status == "copied" else 0)
             except (OSError, ValueError) as exc:
-                failed += 1
+                LOGGER.error("import failed for %s: %s", row["absolute_path"], exc)
                 with self.database.transaction() as connection:
                     connection.execute(
                         "INSERT OR REPLACE INTO import_run_items(run_id,plan_item_id,status,destination_path,owned,error) VALUES (?,?,'failed',?,0,?)",
                         (run_id, row["id"], str(destination), str(exc)),
                     )
                 tracker.record_failure()
+        # Totals are recomputed from item rows so resumed runs never double count retries.
+        final = self.database.connection.execute(
+            """SELECT COALESCE(SUM(status='copied'),0) AS copied,
+            COALESCE(SUM(status='verified_existing'),0) AS reused,
+            COALESCE(SUM(status='failed'),0) AS failed,
+            COALESCE(SUM(CASE WHEN status='copied' THEN size_bytes ELSE 0 END),0) AS written
+            FROM import_run_items WHERE run_id=?""",
+            (run_id,),
+        ).fetchone()
+        failed = int(final["failed"])
         with self.database.transaction() as connection:
             connection.execute(
-                "UPDATE import_runs SET finished_at=?,status=?,copied_count=copied_count+?,failed_count=failed_count+?,bytes_written=bytes_written+? WHERE id=?",
+                "UPDATE import_runs SET finished_at=?,status=?,copied_count=?,reused_count=?,failed_count=?,bytes_written=? WHERE id=?",
                 (
                     utc_now(),
                     "completed_with_errors" if failed else "completed",
-                    copied,
+                    final["copied"],
+                    final["reused"],
                     failed,
-                    written,
+                    final["written"],
                     run_id,
                 ),
             )
@@ -465,9 +643,10 @@ class IncrementalImporter:
             self._import_summary(
                 tracker,
                 total_planned,
-                already_copied + copied,
-                reused,
+                int(final["copied"]),
+                reused + int(final["reused"]),
                 skipped,
+                review,
                 failed,
                 root,
             )
@@ -483,6 +662,7 @@ class IncrementalImporter:
         copied: int,
         reused: int,
         skipped: int,
+        review: int,
         failed: int,
         destination: Path,
     ) -> str:
@@ -494,6 +674,7 @@ class IncrementalImporter:
             f"Copied ............. {copied:,}\n"
             f"Reused ............. {reused:,}\n"
             f"Skipped ............ {skipped:,}\n"
+            f"Needs review ....... {review:,}\n"
             f"Failed ............. {failed:,}\n\n"
             "Data\n\n"
             f"Copied ............. {format_bytes(tracker.completed_bytes)}\n\n"
@@ -513,30 +694,41 @@ class IncrementalImporter:
         )
 
     def _resolve_collision(
-        self, root: Path, relative: Path, row: sqlite3.Row, digest: str | None
-    ) -> tuple[Path, bool, sqlite3.Row | None]:
+        self,
+        root: Path,
+        relative: Path,
+        row: sqlite3.Row,
+        digest: str | None,
+        claimed: set[str],
+    ) -> tuple[Path, bool, sqlite3.Row | None, str | None]:
+        """Pick a destination free on disk and among paths this plan already reserved."""
         destination = safe_destination(root, relative)
-        if not destination.exists():
-            return relative, False, None
-        if destination.is_symlink() or not destination.is_file():
-            raise ValueError(f"unsafe destination collision: {destination}")
-        existing_hash, existing_size = sha256_file(destination)
-        candidate_hash = digest or sha256_file(Path(row["absolute_path"]))[0]
-        if existing_size == row["size_bytes"] and existing_hash == candidate_hash:
-            canonical = self.database.connection.execute(
-                "SELECT * FROM assets WHERE absolute_path=?", (str(destination),)
-            ).fetchone()
-            if canonical is None:
-                self._index_path(destination, "canonical-library", "canonical", existing_hash)
+        if os.path.lexists(destination):
+            if destination.is_symlink() or not destination.is_file():
+                raise ValueError(f"unsafe destination collision: {destination}")
+            existing_hash, existing_size = sha256_file(destination)
+            digest = digest or self._hash_candidate(row)
+            if existing_size == row["size_bytes"] and existing_hash == digest:
+                # Inventory paths are stored resolved; look the reused file up the same way.
+                resolved = str(destination.resolve())
                 canonical = self.database.connection.execute(
-                    "SELECT * FROM assets WHERE absolute_path=?", (str(destination),)
+                    "SELECT * FROM assets WHERE absolute_path=?", (resolved,)
                 ).fetchone()
-            return relative, True, canonical
+                if canonical is None:
+                    self._index_path(destination, "canonical-library", "canonical", existing_hash)
+                    canonical = self.database.connection.execute(
+                        "SELECT * FROM assets WHERE absolute_path=?", (resolved,)
+                    ).fetchone()
+                return relative, True, canonical, digest
+        elif _claim_key(relative) not in claimed:
+            return relative, False, None, digest
         suffix = f"__import_{int(row['id']):08d}"
         candidate = relative.with_name(f"{relative.stem}{suffix}{relative.suffix}")
-        while safe_destination(root, candidate).exists():
+        while (
+            os.path.lexists(safe_destination(root, candidate)) or _claim_key(candidate) in claimed
+        ):
             candidate = candidate.with_name(f"{candidate.stem}_1{candidate.suffix}")
-        return candidate, True, None
+        return candidate, True, None, digest
 
     @staticmethod
     def _copy(
@@ -547,6 +739,14 @@ class IncrementalImporter:
         # Recheck resolved containment and every created parent before opening the temporary.
         safe_destination(root, destination.relative_to(root))
         temporary = destination.parent / f".photo-migrator-import-{run_id}-{item_id}.tmp"
+        if os.path.lexists(temporary):
+            # Only a hard kill leaves this behind; the name is unique to this run item.
+            if not stat.S_ISREG(temporary.lstat().st_mode):
+                raise ValueError(f"unexpected non-regular file at temporary path: {temporary}")
+            LOGGER.warning(
+                "Removing stale temporary file from an interrupted import: %s", temporary
+            )
+            temporary.unlink()
         digest = hashlib.sha256()
         size = 0
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -569,6 +769,21 @@ class IncrementalImporter:
             return final_hash, final_size
         finally:
             temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _existing_copy(row: sqlite3.Row, destination: Path) -> tuple[str, int] | None:
+        """Return the digest of an identical file already at *destination*, if any."""
+        if not os.path.lexists(destination):
+            return None
+        info = destination.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"destination exists and is not a regular file: {destination}")
+        existing = sha256_file(destination)
+        if existing != sha256_file(Path(row["absolute_path"])):
+            raise ValueError(
+                f"destination already exists with different content: {destination}; re-plan the import"
+            )
+        return existing
 
     def _index_created(self, path: Path, row: object, digest: str, size: int) -> None:
         self._index_path(path, "canonical-library", "canonical", digest)
@@ -634,7 +849,10 @@ class IncrementalImporter:
         )
         for filename, actions in (
             ("new_files.csv", {"new"}),
-            ("existing_duplicates.csv", {"duplicate_existing", "reuse_destination"}),
+            (
+                "existing_duplicates.csv",
+                {"duplicate_existing", "duplicate_candidate", "reuse_destination"},
+            ),
             ("name_collisions.csv", set()),
             ("review_items.csv", {"review"}),
         ):
@@ -644,7 +862,12 @@ class IncrementalImporter:
                 else [r for r in rows if r["action"] in actions]
             )
             if filename == "name_collisions.csv":
-                selected = [r for r in selected if "destination" in r["reason"]]
+                selected = [
+                    r
+                    for r in selected
+                    if "destination" in r["reason"]
+                    or "__import_" in (r["destination_relative_path"] or "")
+                ]
             atomic_write_csv(
                 base / filename,
                 (

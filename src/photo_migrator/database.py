@@ -9,7 +9,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+
+# Shared by fresh databases and the schema 8 rebuild, which widened the action CHECK.
+IMPORT_PLAN_ITEMS_TABLE = """
+                CREATE TABLE IF NOT EXISTS {name} (
+                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES import_plans(id),
+                    candidate_asset_id INTEGER NOT NULL REFERENCES assets(id),
+                    action TEXT NOT NULL CHECK(action IN ('new','duplicate_existing',
+                        'duplicate_candidate','reuse_destination','review')),
+                    destination_relative_path TEXT, canonical_asset_id INTEGER REFERENCES assets(id),
+                    matching_canonical_path TEXT, expected_size_bytes INTEGER NOT NULL,
+                    expected_sha256 TEXT, reason TEXT NOT NULL, UNIQUE(plan_id,candidate_asset_id)
+                );
+"""
 
 
 def utc_now() -> str:
@@ -339,16 +352,13 @@ class Database:
                     id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, status TEXT NOT NULL,
                     library_root TEXT NOT NULL, source_filter TEXT, candidate_count INTEGER NOT NULL DEFAULT 0,
                     new_count INTEGER NOT NULL DEFAULT 0, duplicate_count INTEGER NOT NULL DEFAULT 0,
-                    collision_count INTEGER NOT NULL DEFAULT 0, bytes_avoided INTEGER NOT NULL DEFAULT 0
+                    collision_count INTEGER NOT NULL DEFAULT 0, bytes_avoided INTEGER NOT NULL DEFAULT 0,
+                    internal_duplicate_count INTEGER NOT NULL DEFAULT 0,
+                    review_count INTEGER NOT NULL DEFAULT 0
                 );
-                CREATE TABLE IF NOT EXISTS import_plan_items (
-                    id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES import_plans(id),
-                    candidate_asset_id INTEGER NOT NULL REFERENCES assets(id),
-                    action TEXT NOT NULL CHECK(action IN ('new','duplicate_existing','reuse_destination','review')),
-                    destination_relative_path TEXT, canonical_asset_id INTEGER REFERENCES assets(id),
-                    matching_canonical_path TEXT, expected_size_bytes INTEGER NOT NULL,
-                    expected_sha256 TEXT, reason TEXT NOT NULL, UNIQUE(plan_id,candidate_asset_id)
-                );
+                """
+                + IMPORT_PLAN_ITEMS_TABLE.format(name="import_plan_items")
+                + """
                 CREATE TABLE IF NOT EXISTS import_runs (
                     id INTEGER PRIMARY KEY, plan_id INTEGER NOT NULL REFERENCES import_plans(id),
                     started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL,
@@ -386,6 +396,44 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_plan_items_bundle ON migration_plan_items(bundle_key);
                 """
             )
+            plan_columns = {row[1] for row in connection.execute("PRAGMA table_info(import_plans)")}
+            for name in ("internal_duplicate_count", "review_count"):
+                if name not in plan_columns:
+                    connection.execute(
+                        f"ALTER TABLE import_plans ADD COLUMN {name} INTEGER NOT NULL DEFAULT 0"
+                    )
+        self._widen_import_plan_actions()
+
+    def _widen_import_plan_actions(self) -> None:
+        """Rebuild import_plan_items once so its CHECK accepts duplicate_candidate (schema 8)."""
+        row = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='import_plan_items'"
+        ).fetchone()
+        if row is None or "duplicate_candidate" in row["sql"]:
+            return
+        # SQLite cannot alter a CHECK constraint; use its documented table-rebuild procedure.
+        self.connection.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute(
+                    IMPORT_PLAN_ITEMS_TABLE.format(name="import_plan_items_rebuild")
+                )
+                self.connection.execute(
+                    "INSERT INTO import_plan_items_rebuild SELECT * FROM import_plan_items"
+                )
+                self.connection.execute("DROP TABLE import_plan_items")
+                self.connection.execute(
+                    "ALTER TABLE import_plan_items_rebuild RENAME TO import_plan_items"
+                )
+                if self.connection.execute("PRAGMA foreign_key_check").fetchall():
+                    raise sqlite3.IntegrityError("import_plan_items rebuild broke foreign keys")
+                self.connection.execute("COMMIT")
+            except BaseException:
+                self.connection.execute("ROLLBACK")
+                raise
+        finally:
+            self.connection.execute("PRAGMA foreign_keys = ON")
 
     def start_run(self, source_count: int) -> int:
         with self.transaction() as connection:

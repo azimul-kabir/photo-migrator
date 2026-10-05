@@ -43,9 +43,21 @@ INFO Phase 2/2 | Indexed 18,226 / 22,567 canonical assets (79.1%) | 2.96 TiB / 3
 INFO Library indexing complete.
 ```
 
-Planning compares sizes first and hashes a candidate only when canonical files share its size.
-Exact matches record the canonical path and avoid a copy. Real runs are copy-only and verify size
-and SHA-256. Import execution reports progress every 500 files or 30 seconds, whichever comes
+Planning compares sizes first and hashes a candidate only when a canonical file or another
+candidate shares its size. Each plan item gets one action:
+
+- `new`: content absent from the library; it is copied to a destination reserved for this plan
+  (same-name files from different sources get an `__import_<id>` suffix, compared
+  case-insensitively).
+- `duplicate_existing` / `reuse_destination`: identical content is already in the library.
+- `duplicate_candidate`: identical to another candidate in the same plan; only the copy from the
+  highest-priority source is imported.
+- `review`: not imported. The candidate could not be read, or a same-size canonical file is not
+  hashed yet (finish `library-index` and re-plan). See `review_items.csv`.
+
+Real runs are copy-only and verify size and SHA-256. Re-running a completed plan does nothing; a
+resumed run accepts a destination that already holds identical content (recorded as
+`verified_existing`, not owned) and fails, without overwriting, one that holds different content. Import execution reports progress every 500 files or 30 seconds, whichever comes
 first, and resumes its counters from the latest interrupted run:
 
 ```text
