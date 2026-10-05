@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Photo Migrator</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>Photo Migrator</h1>
+      <p class="muted" id="paths">Connecting…</p>
+    </div>
+    <span class="pill" id="connection">offline</span>
+  </header>
+
+  <main>
+    <div class="banner error" id="auth-error" hidden>
+      This page needs the access link printed by <code>photo-migrator gui</code>
+      (it ends in <code>#token=…</code>). Open that link again.
+    </div>
+    <div class="banner error" id="request-error" hidden></div>
+
+    <section class="card job" id="job" hidden>
+      <div class="row">
+        <h2 id="job-title">Working…</h2>
+        <button type="button" class="secondary" id="job-cancel">Stop safely</button>
+      </div>
+      <progress id="job-progress" max="1"></progress>
+      <p id="job-message" class="mono"></p>
+      <p id="job-current" class="muted mono"></p>
+      <p id="job-result"></p>
+      <details>
+        <summary>Log</summary>
+        <pre id="job-log"></pre>
+      </details>
+    </section>
+
+    <section class="card step" id="step-setup">
+      <div class="step-head">
+        <span class="step-number">1</span>
+        <div>
+          <h2>Library and sources</h2>
+          <p class="muted">Your clean library is never reorganized. Sources are only read.</p>
+        </div>
+      </div>
+      <div id="config-summary"></div>
+      <div class="banner error" id="config-error" hidden></div>
+      <form id="config-form" hidden>
+        <p>No configuration file exists yet. Describe your folders and one will be created at
+          <code id="config-path"></code>. It is never overwritten afterwards.</p>
+        <label>Clean library folder (absolute path)
+          <input name="library_root" required placeholder="/volume1/photo/CleanLibrary">
+        </label>
+        <label>Folder inside the library for new imports
+          <input name="default_directory" value="Camera Imports/Unsorted" required>
+        </label>
+        <label class="check">
+          <input type="checkbox" name="preserve_source_subdirectories">
+          Keep each source's sub-folders under that import folder
+        </label>
+        <fieldset>
+          <legend>Read-only sources (higher priority wins when the same photo is in several)</legend>
+          <div id="source-rows"></div>
+          <button type="button" class="secondary" id="add-source">Add source</button>
+        </fieldset>
+        <button type="submit">Create configuration</button>
+      </form>
+    </section>
+
+    <section class="card step" id="step-index">
+      <div class="step-head">
+        <span class="step-number">2</span>
+        <div>
+          <h2>Index the library</h2>
+          <p class="muted">Finds and fingerprints what you already have, so nothing is imported twice.</p>
+        </div>
+      </div>
+      <dl class="stats" id="library-stats"></dl>
+      <div class="actions">
+        <button type="button" data-action="library-index">Index library</button>
+        <button type="button" class="secondary" data-action="library-resume"
+          title="Skip rescanning and only finish fingerprints left by an interrupted run">Resume fingerprinting</button>
+      </div>
+    </section>
+
+    <section class="card step" id="step-scan">
+      <div class="step-head">
+        <span class="step-number">3</span>
+        <div>
+          <h2>Scan sources</h2>
+          <p class="muted">Lists the photos and videos in your sources. Nothing is copied yet.</p>
+        </div>
+      </div>
+      <dl class="stats" id="candidate-stats"></dl>
+      <div class="actions">
+        <button type="button" data-action="import-scan">Scan sources</button>
+      </div>
+    </section>
+
+    <section class="card step" id="step-plan">
+      <div class="step-head">
+        <span class="step-number">4</span>
+        <div>
+          <h2>Plan and review</h2>
+          <p class="muted">Decides, file by file, what is new. Review it before importing.</p>
+        </div>
+      </div>
+      <div class="actions">
+        <button type="button" data-action="import-plan">Create plan</button>
+        <label class="inline">Plan
+          <select id="plan-select"></select>
+        </label>
+      </div>
+      <div id="plan-detail" hidden>
+        <dl class="stats" id="plan-stats"></dl>
+        <div class="tabs" role="tablist" id="plan-tabs">
+          <button type="button" role="tab" data-group="new">New</button>
+          <button type="button" role="tab" data-group="existing">Already in library</button>
+          <button type="button" role="tab" data-group="internal">Duplicates in sources</button>
+          <button type="button" role="tab" data-group="review">Needs review</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Source file</th><th id="target-heading">Goes to</th><th class="num">Size</th></tr></thead>
+            <tbody id="plan-items"></tbody>
+          </table>
+        </div>
+        <div class="pager">
+          <button type="button" class="secondary" id="page-prev">Previous</button>
+          <span id="page-info" class="muted"></span>
+          <button type="button" class="secondary" id="page-next">Next</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card step" id="step-import">
+      <div class="step-head">
+        <span class="step-number">5</span>
+        <div>
+          <h2>Dry run, then import</h2>
+          <p class="muted">The dry run checks every destination without writing. Importing only copies;
+            sources are never changed or deleted.</p>
+        </div>
+      </div>
+      <p id="import-status"></p>
+      <div class="actions">
+        <button type="button" id="dry-run">Dry run</button>
+        <button type="button" class="danger" id="import">Import…</button>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="confirm">
+    <form method="dialog">
+      <h2>Import into your library?</h2>
+      <p id="confirm-summary"></p>
+      <label class="check">
+        <input type="checkbox" id="confirm-check">
+        I reviewed the plan and the dry run
+      </label>
+      <div class="actions">
+        <button value="cancel" class="secondary">Cancel</button>
+        <button value="ok" id="confirm-ok" class="danger" disabled>Import</button>
+      </div>
+    </form>
+  </dialog>
+
+  <template id="source-row">
+    <div class="source-row">
+      <input name="name" placeholder="Name, e.g. iPhone backup" required>
+      <input name="path" placeholder="/volume1/photo/MobileBackup" required>
+      <input name="priority" type="number" value="50" required aria-label="Priority">
+      <button type="button" class="secondary remove">Remove</button>
+    </div>
+  </template>
+</body>
+</html>

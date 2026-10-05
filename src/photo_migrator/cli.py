@@ -203,7 +203,34 @@ def build_parser() -> argparse.ArgumentParser:
     metadata_rollback.add_argument("--run-id", type=int, required=True)
     metadata_rollback.add_argument("--report-dir", type=Path, required=True)
     metadata_rollback.add_argument("--apply", action="store_true")
+    gui = subparsers.add_parser(
+        "gui", help="open a local web interface for the incremental import workflow"
+    )
+    gui.add_argument("--database", type=Path, required=True)
+    gui.add_argument("--config", type=Path, required=True, help="created from the GUI if missing")
+    gui.add_argument("--host", default="127.0.0.1")
+    gui.add_argument("--port", type=int, default=8765, help="0 picks a free port")
+    gui.add_argument("--no-browser", action="store_true", help="only print the access link")
+    gui.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="listen on a non-loopback address (prefer an SSH tunnel; traffic is plain HTTP)",
+    )
     return parser
+
+
+def _cmd_gui(args: argparse.Namespace) -> int:
+    """Serve the local web GUI until interrupted."""
+    from photo_migrator.gui.server import serve
+
+    return serve(
+        args.database,
+        args.config,
+        args.host,
+        args.port,
+        not args.no_browser,
+        args.allow_remote,
+    )
 
 
 def _cmd_metadata_date(args: argparse.Namespace) -> int:
@@ -530,6 +557,7 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
     "verify": _cmd_verify,
     "rollback": _cmd_rollback,
     "stats": _cmd_stats,
+    "gui": _cmd_gui,
 }
 
 

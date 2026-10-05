@@ -45,3 +45,14 @@ or modified in `CleanLibrary`; `--rescan` is an explicit spelling of that defaul
 resume review items are written to `reports/library_resume_review.csv`.
 
 For safe upgrades, stop active work, back up the database, run `git pull`, `uv sync --frozen`, and doctor again. Recovery and rollback only act on database status or verified files owned by a build; inspect dry-run reports first. Hardlinks require source and destination on the same filesystem and make both names refer to the same data: never use hardlink mode if destination files might be edited. Begin with copy mode and a small source. Follow [the first-run runbook](first-run.md).
+
+To use the web interface on the NAS, run it inside `tmux` and tunnel to it from your computer:
+
+```sh
+uv run photo-migrator gui --database /volume1/docker/photo-migrator-data/photo.db --config config.toml --no-browser
+# on your computer:
+ssh -L 8765:127.0.0.1:8765 youruser@nas
+```
+
+Then open the `http://127.0.0.1:8765/#token=…` link the NAS printed. Stopping the server with
+Ctrl+C stops the current step at a safe point; starting the same step again resumes it.

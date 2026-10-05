@@ -12,7 +12,7 @@ and another after successful verification; retain both backups and their JSON si
 The numbered steps below are for the legacy full-migration workflow (see "Choosing a workflow" in
 the README). For the incremental workflow, follow steps 1–4 and 7, then run `library-index`,
 `import-scan`, `import-plan`, review the plan reports, `import-run --dry-run`, and finally
-`import-run --confirm`.
+`import-run --confirm`. `photo-migrator gui` walks through the same incremental steps.
 
 1. Clone the repository, run `uv sync --frozen --dev`, then `uv run photo-migrator --version`.
 2. Copy `config.synology.example.toml` to `config.toml`; review every source, priority, exclusion, and destination.
