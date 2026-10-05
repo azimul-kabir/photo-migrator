@@ -50,7 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     hash_command.add_argument("--limit", type=int)
     hash_command.add_argument("--source")
     hash_command.add_argument("--resume", action="store_true")
-    analyze = subparsers.add_parser("analyze", help="extract normalized media metadata")
+    analyze = subparsers.add_parser(
+        "analyze", help="legacy full-migration: extract normalized media metadata"
+    )
     analyze.add_argument("--database", type=Path, required=True)
     analyze.add_argument("--workers", type=int, default=1)
     analyze.add_argument("--limit", type=int)
@@ -58,7 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--resume", action="store_true")
     analyze.add_argument("--retry-failed", action="store_true")
     analyze.add_argument("--ffprobe", default="ffprobe")
-    relate = subparsers.add_parser("relate", help="detect Live and Motion Photo relationships")
+    relate = subparsers.add_parser(
+        "relate", help="legacy full-migration: detect Live and Motion Photo relationships"
+    )
     relate.add_argument("--database", type=Path, required=True)
     relate.add_argument("--workers", type=int, default=1)
     relate.add_argument("--limit", type=int)
@@ -75,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--include-orphans", action="store_true")
     plan.add_argument("--minimum-fallback-confidence", type=float, default=0.75)
     build = subparsers.add_parser(
-        "build", help="execute a reviewed migration plan (dry-run by default)"
+        "build", help="legacy full-migration: execute a reviewed plan (dry-run by default)"
     )
     build.add_argument("--database", type=Path, required=True)
     build.add_argument("--plan-id", type=int, required=True)
@@ -85,14 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--resume", action="store_true")
     build.add_argument("--verify-only", action="store_true")
     build.add_argument("--limit", type=int)
-    verify = subparsers.add_parser("verify", help="verify one build run's recorded destinations")
+    verify = subparsers.add_parser(
+        "verify", help="legacy full-migration: verify one build run's destinations"
+    )
     verify.add_argument("--database", type=Path, required=True)
     verify.add_argument("--build-run-id", type=int, required=True)
     verify.add_argument("--workers", type=int, default=1)
     verify.add_argument("--limit", type=int)
     verify.add_argument("--repair-metadata-only", action="store_true")
     rollback = subparsers.add_parser(
-        "rollback", help="remove unchanged files owned by one build run"
+        "rollback", help="legacy full-migration: remove unchanged files owned by one build run"
     )
     rollback.add_argument("--database", type=Path, required=True)
     rollback.add_argument("--build-run-id", type=int, required=True)
@@ -123,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--mark-stale-failed", action="store_true")
     recover.add_argument("--older-than-minutes", type=int)
     library_index = subparsers.add_parser(
-        "library-index", help="index the existing canonical library"
+        "library-index", help="incremental: index the existing canonical library"
     )
     library_index.add_argument("--database", type=Path, required=True)
     library_index.add_argument("--config", type=Path, required=True)
@@ -135,17 +141,21 @@ def build_parser() -> argparse.ArgumentParser:
     index_mode.add_argument(
         "--rescan", action="store_true", help="explicitly perform the default full reconciliation"
     )
-    import_scan = subparsers.add_parser("import-scan", help="scan read-only candidate sources")
+    import_scan = subparsers.add_parser(
+        "import-scan", help="incremental: scan read-only candidate sources"
+    )
     import_scan.add_argument("--database", type=Path, required=True)
     import_scan.add_argument("--config", type=Path, required=True)
     import_plan = subparsers.add_parser(
-        "import-plan", help="plan content absent from the canonical library"
+        "import-plan", help="incremental: plan content absent from the canonical library"
     )
     import_plan.add_argument("--database", type=Path, required=True)
     import_plan.add_argument("--config", type=Path, required=True)
     import_plan.add_argument("--source")
     import_plan.add_argument("--limit", type=int)
-    import_run = subparsers.add_parser("import-run", help="execute a copy-only incremental import")
+    import_run = subparsers.add_parser(
+        "import-run", help="incremental: execute a copy-only import (dry-run by default)"
+    )
     import_run.add_argument("--database", type=Path, required=True)
     import_run.add_argument("--config", type=Path, required=True)
     import_run.add_argument("--plan-id", type=int, required=True)

@@ -2,6 +2,20 @@
 
 Photo Migrator is a safety-first utility for consolidating overlapping photo and video archives into one deduplicated, verified library suitable for Immich.
 
+## Choosing a workflow
+
+Photo Migrator has two workflows that share one SQLite inventory but no commands:
+
+| | Incremental import (recommended) | Full migration (legacy) |
+|---|---|---|
+| Use when | A `CleanLibrary` already exists and new archives are added to it over time | Building a brand-new library from several overlapping archives at once |
+| Commands | `library-index`, `import-scan`, `import-plan`, `import-run` | `scan`, `hash`, `analyze`, `relate`, `plan`, `build`, `verify`, `rollback` |
+| Layout | Existing library is never reorganized; imports go to configured folders | Destination is laid out from `[planning].naming_template` |
+| Config | `[library]`, `[imports]` | `[planning]` |
+
+Shared utilities (`init`, `stats`, `doctor`, `db`, `recover`, `metadata-date-*`) work with
+either. Run `photo-migrator --help` to see which workflow each command belongs to.
+
 ## Incremental canonical-library workflow
 
 `CleanLibrary` is the permanent source of truth. Configure it as `[library].root`; configure only
@@ -110,7 +124,7 @@ the previous complete report. The end-to-end smoke test uses temporary synthetic
 - Long-running scans are resumable.
 - Every planned and completed action is auditable.
 
-## Planned workflow
+## Full-migration (legacy) workflow
 
 1. Scan configured source folders into SQLite.
 2. Group duplicate candidates by size.
