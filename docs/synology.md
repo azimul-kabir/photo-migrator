@@ -4,7 +4,7 @@ Configure `/volume1/photo/CleanLibrary` under `[library]`; it is the permanent s
 Candidate folders remain read-only. For Apple Photos configure only
 `/volume1/photo/Photos Library.photoslibrary/originals`, not the package root.
 
-Use Python 3.11 or 3.12 where DSM makes it available (the supported range is 3.9–3.12). If the NAS
+Use Python 3.11 or newer where DSM makes it available (the supported range is 3.9–3.13). If the NAS
 Python is older than 3.9, install a supported interpreter from a trusted package or container; do
 not bypass the project requirement. Deploy only the committed lock with `uv sync --frozen` and do
 not run an unlocked dependency upgrade on the NAS. Upgrade with:
@@ -16,7 +16,7 @@ uv run photo-migrator doctor --database /path/photo.db --config config.toml
 uv run photo-migrator db check --database /path/photo.db
 ```
 
-Photo Migrator supports DSM's Linux environment when Python 3.9–3.12 is available. Install Git and a current Python from Package Center, or a trusted SynoCommunity package where appropriate for your DSM/model. Install an ffmpeg package that includes `ffprobe`; confirm with `command -v ffprobe` and `ffprobe -version`. Package availability differs by DSM release, so verify publisher and architecture rather than pasting unreviewed root commands.
+Photo Migrator supports DSM's Linux environment when Python 3.9–3.13 is available. Install Git and a current Python from Package Center, or a trusted SynoCommunity package where appropriate for your DSM/model. Install an ffmpeg package that includes `ffprobe`; confirm with `command -v ffprobe` and `ffprobe -version`. Package availability differs by DSM release, so verify publisher and architecture rather than pasting unreviewed root commands.
 
 Use an ordinary dedicated DSM user, **not root**, and grant read-only Synology ACL access to sources plus write access only to the destination and data share. Clone to `/volume1/docker/photo-migrator` and keep state at `/volume1/docker/photo-migrator-data/photo.db`. Install `uv` into that user's home or a directory on the shared data volume, then:
 

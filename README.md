@@ -110,7 +110,7 @@ INFO Import complete.
 
 The older commands remain the **legacy full-migration workflow**.
 
-The project lockfile is the deployment contract for Python 3.9–3.12. Use
+The project lockfile is the deployment contract for Python 3.9–3.13. Use
 `uv sync --frozen --dev` for development or `uv sync --frozen` for runtime deployment. CI performs
 the frozen install and all checks on each supported Python version. Reports and JSON sidecars are
 written through same-directory, flushed atomic replacements, so a failed regeneration preserves
@@ -383,7 +383,7 @@ stats` also shows the latest build and rollback counters.
 
 ## Production hardening and support
 
-Release **0.1.0** supports Python 3.9–3.12 on Linux (including compatible Synology DSM environments) and macOS; Windows is not claimed. The package metadata is the authoritative version and follows semantic versioning while the project is pre-1.0. CI tests every supported Python version.
+Release **0.1.0** supports Python 3.9–3.13 on Linux (including compatible Synology DSM environments) and macOS; Windows is not claimed. The package metadata is the authoritative version and follows semantic versioning while the project is pre-1.0. CI tests every supported Python version on Linux, plus the oldest and newest on macOS.
 
 ```sh
 uv sync
