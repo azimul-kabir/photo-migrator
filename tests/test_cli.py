@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from photo_migrator.cli import main
+from photo_migrator.cli import COMMANDS, build_parser, main
 
 
 def test_init_scan_and_stats(tmp_path: Path, capsys: object) -> None:
@@ -44,3 +44,11 @@ def test_library_index_resume_and_rescan_are_mutually_exclusive(tmp_path: Path) 
             ]
         )
     assert error.value.code == 2
+
+
+def test_every_subcommand_has_a_handler() -> None:
+    parser = build_parser()
+    subparsers = next(
+        action for action in parser._actions if action.dest == "command" and action.choices
+    )
+    assert set(subparsers.choices) == set(COMMANDS)
