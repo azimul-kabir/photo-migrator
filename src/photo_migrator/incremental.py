@@ -17,7 +17,13 @@ from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, ConfigError, SourceConfig
 from photo_migrator.database import Database, utc_now
 from photo_migrator.filesystem_safety import contained, safe_destination, sha256_file
-from photo_migrator.progress import ProgressTracker, flush_logger, format_bytes, format_duration
+from photo_migrator.progress import (
+    ProgressListener,
+    ProgressTracker,
+    flush_logger,
+    format_bytes,
+    format_duration,
+)
 from photo_migrator.scanner import Scanner, ScanResult
 
 LOGGER = logging.getLogger(__name__)
@@ -49,11 +55,17 @@ def _require(config: Config) -> Path:
 
 
 class IncrementalImporter:
-    def __init__(self, database: Database, config: Config) -> None:
+    def __init__(
+        self,
+        database: Database,
+        config: Config,
+        progress_listener: ProgressListener | None = None,
+    ) -> None:
         self.database, self.config = database, config
+        self.progress_listener = progress_listener
 
     def _tracker(self, **settings: Any) -> ProgressTracker:
-        return ProgressTracker(LOGGER, **settings)
+        return ProgressTracker(LOGGER, listener=self.progress_listener, **settings)
 
     def library_index(self, workers: int = 1, resume: bool = False) -> ScanResult:
         if workers != 1:
@@ -80,8 +92,7 @@ class IncrementalImporter:
         result = ScanResult()
         if not resume:
             LOGGER.info("Phase 1/2: Scanning canonical library...")
-            scan_tracker = ProgressTracker(
-                LOGGER,
+            scan_tracker = self._tracker(
                 phase_name="Scanning canonical library",
                 total_items=expected_assets,
                 total_bytes=int(before["total_bytes"]),
@@ -113,8 +124,7 @@ class IncrementalImporter:
             """SELECT * FROM assets WHERE asset_role='canonical' AND scan_status='available'
             AND (hash_status!='completed' OR sha256 IS NULL) ORDER BY id"""
         ).fetchall()
-        tracker = ProgressTracker(
-            LOGGER,
+        tracker = self._tracker(
             phase_name="Hashing remaining canonical assets",
             total_items=int(totals["total_assets"]),
             total_bytes=int(totals["total_bytes"]),
@@ -267,7 +277,24 @@ class IncrementalImporter:
 
     def import_scan(self) -> ScanResult:
         _require(self.config)
-        return Scanner(self.database, self.config).scan(self.config.sources, "candidate")
+        known = self.database.connection.execute(
+            """SELECT COUNT(*) AS total_assets, COALESCE(SUM(size_bytes), 0) AS total_bytes
+            FROM assets WHERE asset_role='candidate' AND scan_status='available'"""
+        ).fetchone()
+        tracker = self._tracker(
+            phase_name="Scanning candidate sources",
+            total_items=int(known["total_assets"]),
+            total_bytes=int(known["total_bytes"]),
+            verb="Scanned",
+        )
+
+        def record(size: int | None) -> None:
+            if size is None:
+                tracker.record_failure()
+            else:
+                tracker.record_success(size)
+
+        return Scanner(self.database, self.config).scan(self.config.sources, "candidate", record)
 
     def plan(self, source: str | None = None, limit: int | None = None) -> int:
         root = _require(self.config)
@@ -528,8 +555,18 @@ class IncrementalImporter:
             FROM import_plan_items WHERE plan_id=?""",
             (plan_id,),
         ).fetchone()
-        already_copied = int(prior["copied_count"]) if prior is not None else 0
-        already_written = int(prior["bytes_written"]) if prior is not None else 0
+        # Item rows, not run counters, survive a hard interruption; use the same rule as below.
+        done = self.database.connection.execute(
+            """SELECT COUNT(*) AS items,
+            COALESCE(SUM(CASE WHEN r.status='copied' THEN r.size_bytes ELSE 0 END),0) AS written
+            FROM import_run_items r JOIN import_runs u ON u.id=r.run_id
+            JOIN import_plan_items i ON i.id=r.plan_item_id
+            WHERE i.plan_id=? AND ((r.run_id=? AND r.status='dry_run')
+                OR (u.dry_run=0 AND r.status IN ('copied','verified_existing')))""",
+            (plan_id, run_id),
+        ).fetchone()
+        already_copied = int(done["items"])
+        already_written = int(done["written"])
         skipped = int(action_totals["skipped"])
         reused = int(action_totals["reused"])
         review = int(action_totals["review"])
@@ -565,8 +602,7 @@ class IncrementalImporter:
             ORDER BY i.id""",
             (plan_id, run_id),
         ).fetchall()
-        tracker = ProgressTracker(
-            LOGGER,
+        tracker = self._tracker(
             phase_name="Importing files",
             total_items=total_planned,
             total_bytes=total_bytes,

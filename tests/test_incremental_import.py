@@ -13,6 +13,7 @@ import pytest
 from photo_migrator.config import SourceConfig, load_config
 from photo_migrator.database import IMPORT_PLAN_ITEMS_TABLE, Database
 from photo_migrator.incremental import IncrementalImporter
+from photo_migrator.progress import ProgressSnapshot
 from photo_migrator.scanner import Scanner
 
 
@@ -314,3 +315,51 @@ def test_library_index_warns_that_workers_are_ignored(
     with database:
         importer.library_index(workers=4)
     assert "ignores --workers=4" in caplog.text
+
+
+class _Stop(Exception):
+    pass
+
+
+def test_progress_listener_receives_snapshots_and_can_stop_a_resumable_import(
+    tmp_path: Path,
+) -> None:
+    database, importer, library = _setup(
+        tmp_path, {"a": (1, {"one.jpg": b"one", "two.jpg": b"two!", "three.jpg": b"three"})}
+    )
+    snapshots: list[ProgressSnapshot] = []
+    stop_after_first_copy = False
+
+    def listen(snapshot: ProgressSnapshot) -> None:
+        snapshots.append(snapshot)
+        importing = snapshot.phase_name == "Importing files"
+        if stop_after_first_copy and importing and snapshot.completed_items >= 1:
+            raise _Stop
+
+    importer.progress_listener = listen
+    with database:
+        importer.library_index()
+        importer.import_scan()
+        plan_id = importer.plan()
+        phases = {snapshot.phase_name for snapshot in snapshots}
+        assert {"Scanning candidate sources", "Planning import"} <= phases
+        planning = [s for s in snapshots if s.phase_name == "Planning import"]
+        assert planning[-1].completed_items == planning[-1].total_items == 3
+
+        stop_after_first_copy = True
+        with pytest.raises(_Stop):
+            importer.run(plan_id, dry_run=False, confirm=True)
+        assert len(list(library.rglob("*.jpg"))) == 1
+        stop_after_first_copy = False
+        run_id = importer.run(plan_id, dry_run=False, confirm=True)
+        statuses = [
+            row[0]
+            for row in database.connection.execute(
+                "SELECT status FROM import_run_items WHERE run_id=?", (run_id,)
+            )
+        ]
+    assert statuses == ["copied", "copied", "copied"]
+    assert len(list(library.rglob("*.jpg"))) == 3
+    final = [s for s in snapshots if s.phase_name == "Importing files"][-1]
+    assert final.completed_items == final.total_items == 3
+    assert final.total_bytes == 12

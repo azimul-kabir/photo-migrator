@@ -34,6 +34,27 @@ def format_duration(seconds: float, *, precise: bool = False) -> str:
     return f"{seconds}s" if precise else "<1m"
 
 
+@dataclass(frozen=True)
+class ProgressSnapshot:
+    """Structured progress for listeners such as the GUI; mirrors the logged message."""
+
+    phase: str
+    phase_name: str
+    completed_items: int
+    total_items: int
+    failed: int
+    completed_bytes: int
+    total_bytes: int | None
+    bytes_per_second: float
+    elapsed_seconds: float
+    eta_seconds: float | None
+    current_item: str | None
+    message: str
+
+
+ProgressListener = Callable[[ProgressSnapshot], None]
+
+
 def flush_logger(logger: logging.Logger) -> None:
     """Flush the handlers that can receive a record from *logger*."""
     current: logging.Logger | None = logger
@@ -63,6 +84,7 @@ class ProgressTracker:
     count_failures_as_completed: bool = False
     current_item: str | None = None
     clock: Callable[[], float] = time.monotonic
+    listener: ProgressListener | None = None
     file_interval: int = 500
     time_interval: float = 30.0
     succeeded: int = 0
@@ -77,6 +99,7 @@ class ProgressTracker:
             self.phase = self.phase_name
         self._started_at = self.clock()
         self._last_logged_at = self._started_at
+        self._notify()
 
     @property
     def elapsed(self) -> float:
@@ -114,10 +137,34 @@ class ProgressTracker:
         self.succeeded += 1
         self.bytes_processed += size
         self._maybe_log()
+        self._notify()
 
     def record_failure(self) -> None:
         self.failed += 1
         self._maybe_log()
+        self._notify()
+
+    def snapshot(self) -> ProgressSnapshot:
+        byte_total = self.total_bytes if self.byte_based else None
+        return ProgressSnapshot(
+            phase=self.phase,
+            phase_name=self.phase_name,
+            completed_items=self.completed_items if self.byte_based else self.attempted,
+            total_items=self.total_items,
+            failed=self.failed,
+            completed_bytes=self.completed_bytes if self.byte_based else self.bytes_processed,
+            total_bytes=byte_total,
+            bytes_per_second=self.average_bytes_per_second,
+            elapsed_seconds=self.elapsed,
+            eta_seconds=self.eta_seconds if self.byte_based else None,
+            current_item=self.current_item,
+            message=self.progress_message(),
+        )
+
+    def _notify(self) -> None:
+        # Called on every update; listeners throttle for themselves and may raise to cancel.
+        if self.listener is not None:
+            self.listener(self.snapshot())
 
     def _maybe_log(self) -> None:
         now = self.clock()
