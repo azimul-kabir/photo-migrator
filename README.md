@@ -2,6 +2,54 @@
 
 Photo Migrator is a safety-first utility for consolidating overlapping photo and video archives into one deduplicated, verified library suitable for Immich.
 
+## Choosing a workflow
+
+Photo Migrator has two workflows that share one SQLite inventory but no commands:
+
+| | Incremental import (recommended) | Full migration (legacy) |
+|---|---|---|
+| Use when | A `CleanLibrary` already exists and new archives are added to it over time | Building a brand-new library from several overlapping archives at once |
+| Commands | `library-index`, `import-scan`, `import-plan`, `import-run`, or `gui` for all four | `scan`, `hash`, `analyze`, `relate`, `plan`, `build`, `verify`, `rollback` |
+| Layout | Existing library is never reorganized; imports go to configured folders | Destination is laid out from `[planning].naming_template` |
+| Config | `[library]`, `[imports]` | `[planning]` |
+
+Shared utilities (`init`, `stats`, `doctor`, `db`, `recover`, `metadata-date-*`) work with
+either. Run `photo-migrator --help` to see which workflow each command belongs to.
+
+## Web interface
+
+`photo-migrator gui` runs the incremental workflow from a browser. It shows the same steps, in
+order:
+
+1. Create a configuration (only when the `--config` file does not exist yet; it is never
+   overwritten).
+2. Index the library (or resume fingerprinting).
+3. Scan the sources.
+4. Create a plan and review it: new files with their destinations, files already in the library,
+   duplicates across sources, and items needing review.
+5. Run a dry run, then import.
+
+```bash
+photo-migrator gui --database photo.db --config config.toml
+```
+
+The command prints a private link (`http://127.0.0.1:8765/#token=…`) and opens it. It uses only the
+Python standard library and calls the same code as the CLI, so plans, runs, reports and resume
+behave identically. Safety rules:
+
+- One step runs at a time. **Stop safely** halts at the next file boundary; running the step again
+  resumes it.
+- **Import** stays disabled until a dry run of the same plan has finished, and asks for
+  confirmation. The server enforces both rules too.
+- Rollback and capture-date writes are deliberately CLI-only.
+- The server listens on `127.0.0.1`, requires the link's token for every API call, rejects
+  unexpected `Host` headers, and sends a strict Content-Security-Policy.
+
+On a headless NAS, start it there with `--no-browser` and reach it through an SSH tunnel, for
+example `ssh -L 8765:127.0.0.1:8765 user@nas`, then open the printed link locally.
+`--host 0.0.0.0 --allow-remote` exposes it on the LAN over plain HTTP; use it only on a network
+you trust.
+
 ## Incremental canonical-library workflow
 
 `CleanLibrary` is the permanent source of truth. Configure it as `[library].root`; configure only
@@ -43,9 +91,21 @@ INFO Phase 2/2 | Indexed 18,226 / 22,567 canonical assets (79.1%) | 2.96 TiB / 3
 INFO Library indexing complete.
 ```
 
-Planning compares sizes first and hashes a candidate only when canonical files share its size.
-Exact matches record the canonical path and avoid a copy. Real runs are copy-only and verify size
-and SHA-256. Import execution reports progress every 500 files or 30 seconds, whichever comes
+Planning compares sizes first and hashes a candidate only when a canonical file or another
+candidate shares its size. Each plan item gets one action:
+
+- `new`: content absent from the library; it is copied to a destination reserved for this plan
+  (same-name files from different sources get an `__import_<id>` suffix, compared
+  case-insensitively).
+- `duplicate_existing` / `reuse_destination`: identical content is already in the library.
+- `duplicate_candidate`: identical to another candidate in the same plan; only the copy from the
+  highest-priority source is imported.
+- `review`: not imported. The candidate could not be read, or a same-size canonical file is not
+  hashed yet (finish `library-index` and re-plan). See `review_items.csv`.
+
+Real runs are copy-only and verify size and SHA-256. Re-running a completed plan does nothing; a
+resumed run accepts a destination that already holds identical content (recorded as
+`verified_existing`, not owned) and fails, without overwriting, one that holds different content. Import execution reports progress every 500 files or 30 seconds, whichever comes
 first, and resumes its counters from the latest interrupted run:
 
 ```text
@@ -84,7 +144,7 @@ INFO Import complete.
 
 The older commands remain the **legacy full-migration workflow**.
 
-The project lockfile is the deployment contract for Python 3.9–3.12. Use
+The project lockfile is the deployment contract for Python 3.9–3.13. Use
 `uv sync --frozen --dev` for development or `uv sync --frozen` for runtime deployment. CI performs
 the frozen install and all checks on each supported Python version. Reports and JSON sidecars are
 written through same-directory, flushed atomic replacements, so a failed regeneration preserves
@@ -98,7 +158,7 @@ the previous complete report. The end-to-end smoke test uses temporary synthetic
 - Long-running scans are resumable.
 - Every planned and completed action is auditable.
 
-## Planned workflow
+## Full-migration (legacy) workflow
 
 1. Scan configured source folders into SQLite.
 2. Group duplicate candidates by size.
@@ -357,7 +417,7 @@ stats` also shows the latest build and rollback counters.
 
 ## Production hardening and support
 
-Release **0.1.0** supports Python 3.9–3.12 on Linux (including compatible Synology DSM environments) and macOS; Windows is not claimed. The package metadata is the authoritative version and follows semantic versioning while the project is pre-1.0. CI tests every supported Python version.
+Release **0.1.0** supports Python 3.9–3.13 on Linux (including compatible Synology DSM environments) and macOS; Windows is not claimed. The package metadata is the authoritative version and follows semantic versioning while the project is pre-1.0. CI tests every supported Python version on Linux, plus the oldest and newest on macOS.
 
 ```sh
 uv sync
@@ -395,6 +455,13 @@ Before every write the size and nanosecond mtime are checked and metadata is re-
 date is re-read for verification and the original filesystem mtime is restored by default. Relevant
 before-values are retained in SQLite for run-scoped rollback. Metadata writes necessarily alter file
 bytes and hashes, and inferred dates are evidence-based proposals—not guaranteed historical truth.
+
+Before each real write the original file is copied to
+`<report-dir>/metadata-backups/apply-<run>/` and verified against the planned SHA-256, so plan for
+free space equal to the images being changed. Rollback restores those exact bytes and the original
+mtime, and only when the file still matches what the apply run wrote. A write that changed a file
+but failed verification is recorded as `write_unverified` (never silently skipped) and can be
+rolled back the same way. Keep the backup folder until you have checked the results.
 
 Recommended first run (use one or two workers for a DS220+; writing is currently serialized):
 

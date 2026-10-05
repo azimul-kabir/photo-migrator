@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from photo_migrator.cli import main
+from photo_migrator.config import ConfigError, load_config
 from photo_migrator.database import Database
 from photo_migrator.db_tools import backup_database, check_database, sha256_file
 from photo_migrator.recovery import audit
@@ -41,3 +44,18 @@ def test_cli_version_and_interrupt_exit_codes(capsys: object) -> None:
         main(["--version"])
     except SystemExit as exc:
         assert exc.code == 0
+
+
+def test_library_inside_a_source_must_be_excluded(tmp_path: Path) -> None:
+    library = tmp_path / "photo" / "CleanLibrary"
+    library.mkdir(parents=True)
+    config = tmp_path / "config.toml"
+    base = (
+        f'[[sources]]\nname="photo"\npath="{tmp_path / "photo"}"\n'
+        f'[library]\nroot="{library}"\n[scan]\nextensions=[".jpg"]\n'
+    )
+    config.write_text(base)
+    with pytest.raises(ConfigError, match="inside source photo"):
+        load_config(config)
+    config.write_text(base + 'exclude_directory_names=["CleanLibrary"]\n')
+    assert load_config(config).library is not None

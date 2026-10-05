@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import csv
 import hashlib
 import subprocess
@@ -218,6 +220,9 @@ def test_rollback_refreshes_identity_and_index_never_reuses_apply_hash(
     database, recovery, path, plan_id = recovery_fixture(tmp_path, FakeExifTool())
     apply_run = recovery.apply(plan_id, apply=True, preserve_times=False)
     applied_hash = database.connection.execute("SELECT sha256 FROM assets").fetchone()[0]
+    # Runs recorded before byte backups existed fall back to removing the written tags.
+    with database.transaction() as connection:
+        connection.execute("UPDATE metadata_date_apply_items SET backup_path=NULL")
 
     def rollback_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         del kwargs
@@ -233,4 +238,84 @@ def test_rollback_refreshes_identity_and_index_never_reuses_apply_hash(
     assert row["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
     assert row["sha256"] != applied_hash and row["hash_status"] == "completed"
     assert row["size_bytes"] == path.stat().st_size
+    database.close()
+
+
+class CorruptingExifTool(FakeExifTool):
+    """Reports success but leaves the file changed without the requested date."""
+
+    def write(
+        self, path: Path, timestamp: str, comment: str | None
+    ) -> subprocess.CompletedProcess[str]:
+        del timestamp, comment
+        path.write_bytes(path.read_bytes() + b"|mangled")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+
+def _no_exiftool(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+    raise AssertionError("byte restore must not invoke ExifTool")
+
+
+def test_apply_keeps_verified_byte_backup_and_rollback_restores_it_exactly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database, recovery, path, plan_id = recovery_fixture(tmp_path, FakeExifTool())
+    original_bytes, original_mtime = path.read_bytes(), path.stat().st_mtime_ns
+    apply_run = recovery.apply(plan_id, apply=True, preserve_times=False)
+    item = database.connection.execute("SELECT * FROM metadata_date_apply_items").fetchone()
+    backup = Path(item["backup_path"])
+    assert backup.read_bytes() == original_bytes
+    assert item["backup_sha256"] == hashlib.sha256(original_bytes).hexdigest()
+    assert item["after_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    monkeypatch.setattr(subprocess, "run", _no_exiftool)
+    recovery.rollback(apply_run, apply=True)
+    assert path.read_bytes() == original_bytes
+    assert path.stat().st_mtime_ns == original_mtime
+    row = database.connection.execute("SELECT size_bytes,mtime_ns,sha256 FROM assets").fetchone()
+    assert tuple(row) == (
+        len(original_bytes),
+        original_mtime,
+        hashlib.sha256(original_bytes).hexdigest(),
+    )
+    assert list(path.parent.glob(".photo-migrator-restore-*")) == []
+    database.close()
+
+
+def test_unverified_write_is_recorded_and_can_be_rolled_back(tmp_path: Path) -> None:
+    database, recovery, path, plan_id = recovery_fixture(tmp_path, CorruptingExifTool())
+    original_bytes = path.read_bytes()
+    apply_run = recovery.apply(plan_id, apply=True, preserve_times=False)
+    item = database.connection.execute("SELECT * FROM metadata_date_apply_items").fetchone()
+    assert item["status"] == "write_unverified"
+    assert "verification failed" in item["error"]
+    asset = database.connection.execute("SELECT sha256 FROM assets").fetchone()
+    assert asset["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+    recovery.rollback(apply_run, apply=True)
+    assert path.read_bytes() == original_bytes
+    database.close()
+
+
+def test_rollback_refuses_to_restore_over_later_changes(tmp_path: Path) -> None:
+    database, recovery, path, plan_id = recovery_fixture(tmp_path, FakeExifTool())
+    apply_run = recovery.apply(plan_id, apply=True, preserve_times=False)
+    path.write_bytes(path.read_bytes() + b"|edited later")
+    edited = path.read_bytes()
+    rollback_run = recovery.rollback(apply_run, apply=True)
+    assert path.read_bytes() == edited
+    report = tmp_path / "reports" / f"metadata-date-rollback-{rollback_run}.csv"
+    row = next(csv.DictReader(report.open()))
+    assert row["status"] == "skipped"
+    assert "changed after the apply run" in row["error"]
+    database.close()
+
+
+def test_failed_write_without_changes_is_skipped_not_unverified(tmp_path: Path) -> None:
+    database, recovery, _path, plan_id = recovery_fixture(tmp_path, FakeExifTool(fail=True))
+    recovery.apply(plan_id, apply=True)
+    status = database.connection.execute("SELECT status FROM metadata_date_apply_items").fetchone()[
+        0
+    ]
+    assert status == "skipped"
     database.close()

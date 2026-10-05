@@ -7,6 +7,7 @@ import pytest
 
 from photo_migrator.config import Config, ConfigError, ScanConfig, SourceConfig, load_config
 from photo_migrator.database import Database
+from photo_migrator.media_types import media_type_for
 from photo_migrator.scanner import Scanner, _contained
 
 
@@ -166,3 +167,9 @@ def test_scandir_error_is_visible_and_prevents_missing_marking(
         assert run[1] == 1
         assert "synthetic denial" in run[2]
         assert database.stats()["errors"] == 1
+
+
+def test_media_type_classification_covers_common_video_containers() -> None:
+    assert media_type_for(".MOV") == "video"
+    assert all(media_type_for(ext) == "video" for ext in (".avi", ".mts", ".3gp", ".mkv"))
+    assert all(media_type_for(ext) == "image" for ext in (".jpg", ".heic", ".dng", ".png"))

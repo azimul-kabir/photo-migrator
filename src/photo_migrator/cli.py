@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from photo_migrator import __version__
@@ -50,7 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
     hash_command.add_argument("--limit", type=int)
     hash_command.add_argument("--source")
     hash_command.add_argument("--resume", action="store_true")
-    analyze = subparsers.add_parser("analyze", help="extract normalized media metadata")
+    analyze = subparsers.add_parser(
+        "analyze", help="legacy full-migration: extract normalized media metadata"
+    )
     analyze.add_argument("--database", type=Path, required=True)
     analyze.add_argument("--workers", type=int, default=1)
     analyze.add_argument("--limit", type=int)
@@ -58,7 +60,9 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--resume", action="store_true")
     analyze.add_argument("--retry-failed", action="store_true")
     analyze.add_argument("--ffprobe", default="ffprobe")
-    relate = subparsers.add_parser("relate", help="detect Live and Motion Photo relationships")
+    relate = subparsers.add_parser(
+        "relate", help="legacy full-migration: detect Live and Motion Photo relationships"
+    )
     relate.add_argument("--database", type=Path, required=True)
     relate.add_argument("--workers", type=int, default=1)
     relate.add_argument("--limit", type=int)
@@ -75,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--include-orphans", action="store_true")
     plan.add_argument("--minimum-fallback-confidence", type=float, default=0.75)
     build = subparsers.add_parser(
-        "build", help="execute a reviewed migration plan (dry-run by default)"
+        "build", help="legacy full-migration: execute a reviewed plan (dry-run by default)"
     )
     build.add_argument("--database", type=Path, required=True)
     build.add_argument("--plan-id", type=int, required=True)
@@ -85,14 +89,16 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--resume", action="store_true")
     build.add_argument("--verify-only", action="store_true")
     build.add_argument("--limit", type=int)
-    verify = subparsers.add_parser("verify", help="verify one build run's recorded destinations")
+    verify = subparsers.add_parser(
+        "verify", help="legacy full-migration: verify one build run's destinations"
+    )
     verify.add_argument("--database", type=Path, required=True)
     verify.add_argument("--build-run-id", type=int, required=True)
     verify.add_argument("--workers", type=int, default=1)
     verify.add_argument("--limit", type=int)
     verify.add_argument("--repair-metadata-only", action="store_true")
     rollback = subparsers.add_parser(
-        "rollback", help="remove unchanged files owned by one build run"
+        "rollback", help="legacy full-migration: remove unchanged files owned by one build run"
     )
     rollback.add_argument("--database", type=Path, required=True)
     rollback.add_argument("--build-run-id", type=int, required=True)
@@ -123,11 +129,16 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("--mark-stale-failed", action="store_true")
     recover.add_argument("--older-than-minutes", type=int)
     library_index = subparsers.add_parser(
-        "library-index", help="index the existing canonical library"
+        "library-index", help="incremental: index the existing canonical library"
     )
     library_index.add_argument("--database", type=Path, required=True)
     library_index.add_argument("--config", type=Path, required=True)
-    library_index.add_argument("--workers", type=int, default=1)
+    library_index.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="accepted for compatibility; hashing is serialized with SQLite writes",
+    )
     index_mode = library_index.add_mutually_exclusive_group()
     index_mode.add_argument(
         "--resume", action="store_true", help="skip reconciliation and hash pending inventory"
@@ -135,17 +146,21 @@ def build_parser() -> argparse.ArgumentParser:
     index_mode.add_argument(
         "--rescan", action="store_true", help="explicitly perform the default full reconciliation"
     )
-    import_scan = subparsers.add_parser("import-scan", help="scan read-only candidate sources")
+    import_scan = subparsers.add_parser(
+        "import-scan", help="incremental: scan read-only candidate sources"
+    )
     import_scan.add_argument("--database", type=Path, required=True)
     import_scan.add_argument("--config", type=Path, required=True)
     import_plan = subparsers.add_parser(
-        "import-plan", help="plan content absent from the canonical library"
+        "import-plan", help="incremental: plan content absent from the canonical library"
     )
     import_plan.add_argument("--database", type=Path, required=True)
     import_plan.add_argument("--config", type=Path, required=True)
     import_plan.add_argument("--source")
     import_plan.add_argument("--limit", type=int)
-    import_run = subparsers.add_parser("import-run", help="execute a copy-only incremental import")
+    import_run = subparsers.add_parser(
+        "import-run", help="incremental: execute a copy-only import (dry-run by default)"
+    )
     import_run.add_argument("--database", type=Path, required=True)
     import_run.add_argument("--config", type=Path, required=True)
     import_run.add_argument("--plan-id", type=int, required=True)
@@ -188,271 +203,369 @@ def build_parser() -> argparse.ArgumentParser:
     metadata_rollback.add_argument("--run-id", type=int, required=True)
     metadata_rollback.add_argument("--report-dir", type=Path, required=True)
     metadata_rollback.add_argument("--apply", action="store_true")
+    gui = subparsers.add_parser(
+        "gui", help="open a local web interface for the incremental import workflow"
+    )
+    gui.add_argument("--database", type=Path, required=True)
+    gui.add_argument("--config", type=Path, required=True, help="created from the GUI if missing")
+    gui.add_argument("--host", default="127.0.0.1")
+    gui.add_argument("--port", type=int, default=8765, help="0 picks a free port")
+    gui.add_argument("--no-browser", action="store_true", help="only print the access link")
+    gui.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="listen on a non-loopback address (prefer an SSH tunnel; traffic is plain HTTP)",
+    )
     return parser
+
+
+def _cmd_gui(args: argparse.Namespace) -> int:
+    """Serve the local web GUI until interrupted."""
+    from photo_migrator.gui.server import serve
+
+    return serve(
+        args.database,
+        args.config,
+        args.host,
+        args.port,
+        not args.no_browser,
+        args.allow_remote,
+    )
+
+
+def _cmd_metadata_date(args: argparse.Namespace) -> int:
+    """Scan, plan, apply, or roll back capture-date recovery."""
+    config = load_config(args.config)
+    with Database(args.database) as database:
+        database.initialize()
+        recovery = DateRecovery(database, config.metadata_date_recovery, args.report_dir)
+        if args.command == "metadata-date-scan":
+            root = args.root or (config.library.root if config.library else None)
+            if root is None:
+                raise ConfigError("metadata-date-scan requires --root or library.root")
+            run_id = recovery.scan(root, args.limit)
+        elif args.command == "metadata-date-plan":
+            run_id = recovery.plan(
+                args.scan_run_id, args.min_confidence, args.allow_estimated_dates
+            )
+        elif args.command == "metadata-date-apply":
+            run_id = recovery.apply(
+                args.plan_id, args.apply, not args.no_preserve_filesystem_times, args.limit
+            )
+        else:
+            run_id = recovery.rollback(args.run_id, args.apply)
+    print(
+        f"{args.command} run {run_id} complete ({'APPLY' if getattr(args, 'apply', False) else 'dry run/read only'})"
+    )
+    return 0
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Audit the environment and database."""
+    diagnostic, code = run_doctor(
+        args.database,
+        args.config,
+        args.plan_id,
+        args.check_hardlinks,
+        args.check_write_access,
+        args.strict,
+    )
+    print(
+        json.dumps(diagnostic, indent=2, sort_keys=True)
+        if args.json
+        else "\n".join(
+            f"{item['status']:4} {item['name']}: {item['message']}" for item in diagnostic["checks"]
+        )
+    )
+    return code
+
+
+def _cmd_db(args: argparse.Namespace) -> int:
+    """Back up or integrity-check the database."""
+    if args.db_command == "backup":
+        print(
+            json.dumps(
+                backup_database(args.database, args.output, args.overwrite, args.verify),
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    db_result = check_database(args.database, args.full)
+    print(
+        json.dumps(db_result, indent=2, sort_keys=True)
+        if args.json
+        else f"{db_result['check']}: {', '.join(db_result['integrity'])}; schema={db_result['schema_version']}"
+    )
+    return 0 if db_result["ok"] else 2
+
+
+def _cmd_recover(args: argparse.Namespace) -> int:
+    """Audit interrupted runs."""
+    recovery_result = audit(args.database, args.older_than_minutes, args.mark_stale_failed)
+    print(
+        json.dumps(recovery_result, indent=2, sort_keys=True)
+        if args.json
+        else f"Stale runs: {len(recovery_result['stale_runs'])}; records updated: {recovery_result['records_updated']}"
+    )
+    return 1 if recovery_result["stale_runs"] and not args.mark_stale_failed else 0
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    """Create an inventory database."""
+    args.database.parent.mkdir(parents=True, exist_ok=True)
+    with Database(args.database) as database:
+        database.initialize()
+    print(f"Initialized database: {args.database}")
+    return 0
+
+
+def _cmd_scan(args: argparse.Namespace) -> int:
+    """Legacy full-migration scan."""
+    config = load_config(args.config)
+    with Database(args.database) as database:
+        database.initialize()
+        result = Scanner(database, config).scan()
+    print(
+        f"Scan complete: discovered={result.discovered} indexed={result.indexed} "
+        f"errors={len(result.errors)}"
+    )
+    return 0 if not result.errors else 2
+
+
+def _cmd_incremental(args: argparse.Namespace) -> int:
+    """Index the library, then scan, plan, and run incremental imports."""
+    config = load_config(args.config)
+    with Database(args.database) as database:
+        database.initialize()
+        importer = IncrementalImporter(database, config)
+        if args.command == "library-index":
+            result = importer.library_index(args.workers, args.resume)
+            return 0 if not result.errors else 2
+        if args.command == "import-scan":
+            result = importer.import_scan()
+            print(f"Import scan complete: indexed={result.indexed} errors={len(result.errors)}")
+            return 0 if not result.errors else 2
+        if args.command == "import-plan":
+            plan_id = importer.plan(args.source, args.limit)
+            print(f"Import plan {plan_id} ready")
+            return 0
+        run_id = importer.run(args.plan_id, args.dry_run or not args.confirm, args.confirm)
+        print(f"Import run {run_id} complete")
+        return 0
+
+
+def _cmd_hash(args: argparse.Namespace) -> int:
+    """Hash duplicate candidates."""
+    with Database(args.database) as database:
+        database.initialize()
+        return HashEngine(database, args.workers).run(args.limit, args.source, args.resume)
+
+
+def _cmd_analyze(args: argparse.Namespace) -> int:
+    """Extract media metadata."""
+    with Database(args.database) as database:
+        database.initialize()
+        return AnalysisEngine(database, args.workers, args.ffprobe).run(
+            args.limit, args.source, args.resume, args.retry_failed
+        )
+
+
+def _cmd_relate(args: argparse.Namespace) -> int:
+    """Detect Live and Motion Photo relationships."""
+    with Database(args.database) as database:
+        database.initialize()
+        return RelationshipEngine(database, args.workers, args.ffprobe).run(
+            args.limit, args.source, args.resume, args.retry_failed
+        )
+
+
+def _cmd_plan(args: argparse.Namespace) -> int:
+    """Create a legacy migration plan."""
+    config = load_config(args.config)
+    with Database(args.database) as database:
+        database.initialize()
+        plan_result = Planner(database, config).run(
+            args.source,
+            args.limit,
+            args.supersede_draft,
+            args.include_orphans,
+            args.minimum_fallback_confidence,
+        )
+    print(
+        f"Plan {plan_result.plan_id}: status={plan_result.status} "
+        f"candidates={plan_result.candidates} items={plan_result.items} "
+        f"collisions={plan_result.collisions} blocked={plan_result.blocked}"
+    )
+    return 0 if plan_result.status != "blocked" else 2
+
+
+def _cmd_build(args: argparse.Namespace) -> int:
+    """Execute a reviewed migration plan."""
+    with Database(args.database) as database:
+        database.initialize()
+        run_id = Builder(database, args.workers).run(
+            args.plan_id,
+            args.mode,
+            args.allow_draft,
+            args.resume,
+            args.verify_only,
+            args.limit,
+        )
+    print(f"Build run {run_id} complete")
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    """Verify one build run."""
+    with Database(args.database) as database:
+        database.initialize()
+        results = Verifier(database, args.workers).run(
+            args.build_run_id, args.limit, args.repair_metadata_only
+        )
+    failed = sum(result.status == "verification_failed" for result in results)
+    print(f"Verification complete: checked={len(results)} failed={failed}")
+    return 2 if failed else 0
+
+
+def _cmd_rollback(args: argparse.Namespace) -> int:
+    """Remove unchanged files owned by one build run."""
+    dry_run = args.dry_run or not args.confirm_owned_files_only
+    with Database(args.database) as database:
+        database.initialize()
+        rollback_results = Rollback(database).run(
+            args.build_run_id, dry_run, args.confirm_owned_files_only
+        )
+    print(f"Rollback {'dry-run' if dry_run else 'complete'}: items={len(rollback_results)}")
+    return 0
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    """Print inventory statistics."""
+    with Database(args.database) as database:
+        database.initialize()
+        stats = database.stats()
+    print(f"Total indexed assets: {stats['total']}")
+    print(f"Currently available assets: {stats['available']}")
+    print(f"Missing assets: {stats['missing']}")
+    print(f"Scan errors: {stats['errors']}")
+    print(f"Total bytes: {stats['bytes']}")
+    print(f"Canonical file count: {stats['canonical_count']}")
+    print(f"Canonical bytes: {stats['canonical_bytes']}")
+    print(f"Canonical hashed count: {stats['canonical_hashed']}")
+    print(f"Candidate file count: {stats['candidate_count']}")
+    import_plan = stats["latest_import_plan"]
+    print(f"Latest import plan ID: {import_plan['id'] if import_plan else 'none'}")
+    print(f"Candidates already present: {import_plan['duplicate_count'] if import_plan else 0}")
+    print(f"Candidates planned as new: {import_plan['new_count'] if import_plan else 0}")
+    print(
+        "Candidates duplicated within sources: "
+        f"{import_plan['internal_duplicate_count'] if import_plan else 0}"
+    )
+    print(f"Candidates needing review: {import_plan['review_count'] if import_plan else 0}")
+    print(
+        f"Bytes avoided through existing duplicates: {import_plan['bytes_avoided'] if import_plan else 0}"
+    )
+    import_run = stats["latest_import_run"]
+    print(f"Latest import run ID: {import_run['id'] if import_run else 'none'}")
+    print("Totals by source:")
+    for row in stats["by_source"]:
+        print(f"  {row['source_name']}: {row['count']}")
+    print("Totals by extension:")
+    for row in stats["by_extension"]:
+        print(f"  {row['extension']}: {row['count']}")
+    latest = stats["latest_run"]
+    print(f"Latest scan-run status: {latest['status'] if latest else 'none'}")
+    print(f"Completed analyses: {stats['analyses_completed']}")
+    print(f"Failed analyses: {stats['analyses_failed']}")
+    print(f"Unsupported analyses: {stats['analyses_unsupported']}")
+    print(f"Assets with captured dates: {stats['with_captured_at']}")
+    print(f"Assets with GPS: {stats['with_gps']}")
+    print(f"Image count: {stats['images']}")
+    print(f"Video count: {stats['videos']}")
+    latest_analysis = stats["latest_analysis_run"]
+    print(f"Latest analysis-run status: {latest_analysis['status'] if latest_analysis else 'none'}")
+    print(f"Active relationships: {stats['relationships_active']}")
+    print(f"Apple Live Photos: {stats['apple_live_photos']}")
+    print(f"Exact Apple identifier pairs: {stats['apple_live_photos_exact']}")
+    print(f"One-sided Apple identifier fallback pairs: {stats['apple_live_photos_one_sided']}")
+    print(f"Google Motion Photos: {stats['google_motion_photos']}")
+    print(f"Samsung Motion Photos: {stats['samsung_motion_photos']}")
+    print(f"Fallback filename pairs: {stats['filename_pairs']}")
+    print(f"Orphan motion images: {stats['orphan_motion_images']}")
+    print(f"Orphan motion videos: {stats['orphan_motion_videos']}")
+    print(f"Ambiguous relationships: {stats['ambiguous_relationships']}")
+    print(f"Invalid relationships: {stats['invalid_relationships']}")
+    latest_relationship = stats["latest_relationship_run"]
+    print(
+        "Latest relationship-run status: "
+        f"{latest_relationship['status'] if latest_relationship else 'none'}"
+    )
+    latest_plan = stats["latest_plan"]
+    counts = stats["latest_plan_counts"]
+    print(f"Latest plan ID: {latest_plan['id'] if latest_plan else 'none'}")
+    print(f"Latest plan status: {latest_plan['status'] if latest_plan else 'none'}")
+    print(
+        f"Latest plan candidate assets: {latest_plan['source_asset_count'] if latest_plan else 0}"
+    )
+    for label, key in (
+        ("keep actions", "keep_count"),
+        ("duplicate skips", "duplicate_skips"),
+        ("relationship members", "relationship_members"),
+        ("review items", "review_items"),
+        ("blocked items", "blocked_items"),
+        ("collisions", "collisions"),
+    ):
+        print(f"Latest plan {label}: {counts[key] or 0 if counts else 0}")
+    latest_build = stats["latest_build_run"]
+    print(f"Latest build run ID: {latest_build['id'] if latest_build else 'none'}")
+    print(f"Latest build run plan ID: {latest_build['plan_id'] if latest_build else 'none'}")
+    for label, key in (
+        ("mode", "mode"),
+        ("status", "status"),
+        ("completed items", "completed_items"),
+        ("failed items", "failed_items"),
+        ("verified items", "verified_items"),
+        ("verification failures", "verification_failed_items"),
+        ("bytes written", "bytes_written"),
+        ("rollback status", "rollback_status"),
+    ):
+        default = "none" if key in {"mode", "status", "rollback_status"} else 0
+        print(f"Latest build {label}: {latest_build[key] if latest_build else default}")
+    return 0
+
+
+COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {
+    "metadata-date-scan": _cmd_metadata_date,
+    "metadata-date-plan": _cmd_metadata_date,
+    "metadata-date-apply": _cmd_metadata_date,
+    "metadata-date-rollback": _cmd_metadata_date,
+    "doctor": _cmd_doctor,
+    "db": _cmd_db,
+    "recover": _cmd_recover,
+    "init": _cmd_init,
+    "scan": _cmd_scan,
+    "library-index": _cmd_incremental,
+    "import-scan": _cmd_incremental,
+    "import-plan": _cmd_incremental,
+    "import-run": _cmd_incremental,
+    "hash": _cmd_hash,
+    "analyze": _cmd_analyze,
+    "relate": _cmd_relate,
+    "plan": _cmd_plan,
+    "build": _cmd_build,
+    "verify": _cmd_verify,
+    "rollback": _cmd_rollback,
+    "stats": _cmd_stats,
+    "gui": _cmd_gui,
+}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging(args.log_level, args.log_format, args.log_file)
     try:
-        if args.command.startswith("metadata-date-"):
-            config = load_config(args.config)
-            with Database(args.database) as database:
-                database.initialize()
-                recovery = DateRecovery(database, config.metadata_date_recovery, args.report_dir)
-                if args.command == "metadata-date-scan":
-                    root = args.root or (config.library.root if config.library else None)
-                    if root is None:
-                        raise ConfigError("metadata-date-scan requires --root or library.root")
-                    run_id = recovery.scan(root, args.limit)
-                elif args.command == "metadata-date-plan":
-                    run_id = recovery.plan(
-                        args.scan_run_id, args.min_confidence, args.allow_estimated_dates
-                    )
-                elif args.command == "metadata-date-apply":
-                    run_id = recovery.apply(
-                        args.plan_id, args.apply, not args.no_preserve_filesystem_times, args.limit
-                    )
-                else:
-                    run_id = recovery.rollback(args.run_id, args.apply)
-            print(
-                f"{args.command} run {run_id} complete ({'APPLY' if getattr(args, 'apply', False) else 'dry run/read only'})"
-            )
-            return 0
-        if args.command == "doctor":
-            diagnostic, code = run_doctor(
-                args.database,
-                args.config,
-                args.plan_id,
-                args.check_hardlinks,
-                args.check_write_access,
-                args.strict,
-            )
-            print(
-                json.dumps(diagnostic, indent=2, sort_keys=True)
-                if args.json
-                else "\n".join(
-                    f"{item['status']:4} {item['name']}: {item['message']}"
-                    for item in diagnostic["checks"]
-                )
-            )
-            return code
-        if args.command == "db":
-            if args.db_command == "backup":
-                print(
-                    json.dumps(
-                        backup_database(args.database, args.output, args.overwrite, args.verify),
-                        indent=2,
-                        sort_keys=True,
-                    )
-                )
-                return 0
-            db_result = check_database(args.database, args.full)
-            print(
-                json.dumps(db_result, indent=2, sort_keys=True)
-                if args.json
-                else f"{db_result['check']}: {', '.join(db_result['integrity'])}; schema={db_result['schema_version']}"
-            )
-            return 0 if db_result["ok"] else 2
-        if args.command == "recover":
-            recovery_result = audit(args.database, args.older_than_minutes, args.mark_stale_failed)
-            print(
-                json.dumps(recovery_result, indent=2, sort_keys=True)
-                if args.json
-                else f"Stale runs: {len(recovery_result['stale_runs'])}; records updated: {recovery_result['records_updated']}"
-            )
-            return 1 if recovery_result["stale_runs"] and not args.mark_stale_failed else 0
-        if args.command == "init":
-            args.database.parent.mkdir(parents=True, exist_ok=True)
-            with Database(args.database) as database:
-                database.initialize()
-            print(f"Initialized database: {args.database}")
-            return 0
-        if args.command == "scan":
-            config = load_config(args.config)
-            with Database(args.database) as database:
-                database.initialize()
-                result = Scanner(database, config).scan()
-            print(
-                f"Scan complete: discovered={result.discovered} indexed={result.indexed} "
-                f"errors={len(result.errors)}"
-            )
-            return 0 if not result.errors else 2
-        if args.command in {"library-index", "import-scan", "import-plan", "import-run"}:
-            config = load_config(args.config)
-            with Database(args.database) as database:
-                database.initialize()
-                importer = IncrementalImporter(database, config)
-                if args.command == "library-index":
-                    result = importer.library_index(args.workers, args.resume)
-                    return 0 if not result.errors else 2
-                if args.command == "import-scan":
-                    result = importer.import_scan()
-                    print(
-                        f"Import scan complete: indexed={result.indexed} errors={len(result.errors)}"
-                    )
-                    return 0 if not result.errors else 2
-                if args.command == "import-plan":
-                    plan_id = importer.plan(args.source, args.limit)
-                    print(f"Import plan {plan_id} ready")
-                    return 0
-                run_id = importer.run(args.plan_id, args.dry_run or not args.confirm, args.confirm)
-                print(f"Import run {run_id} complete")
-                return 0
-        if args.command == "hash":
-            with Database(args.database) as database:
-                database.initialize()
-                return HashEngine(database, args.workers).run(args.limit, args.source, args.resume)
-        if args.command == "analyze":
-            with Database(args.database) as database:
-                database.initialize()
-                return AnalysisEngine(database, args.workers, args.ffprobe).run(
-                    args.limit, args.source, args.resume, args.retry_failed
-                )
-        if args.command == "relate":
-            with Database(args.database) as database:
-                database.initialize()
-                return RelationshipEngine(database, args.workers, args.ffprobe).run(
-                    args.limit, args.source, args.resume, args.retry_failed
-                )
-        if args.command == "plan":
-            config = load_config(args.config)
-            with Database(args.database) as database:
-                database.initialize()
-                plan_result = Planner(database, config).run(
-                    args.source,
-                    args.limit,
-                    args.supersede_draft,
-                    args.include_orphans,
-                    args.minimum_fallback_confidence,
-                )
-            print(
-                f"Plan {plan_result.plan_id}: status={plan_result.status} "
-                f"candidates={plan_result.candidates} items={plan_result.items} "
-                f"collisions={plan_result.collisions} blocked={plan_result.blocked}"
-            )
-            return 0 if plan_result.status != "blocked" else 2
-        if args.command == "build":
-            with Database(args.database) as database:
-                database.initialize()
-                run_id = Builder(database, args.workers).run(
-                    args.plan_id,
-                    args.mode,
-                    args.allow_draft,
-                    args.resume,
-                    args.verify_only,
-                    args.limit,
-                )
-            print(f"Build run {run_id} complete")
-            return 0
-        if args.command == "verify":
-            with Database(args.database) as database:
-                database.initialize()
-                results = Verifier(database, args.workers).run(
-                    args.build_run_id, args.limit, args.repair_metadata_only
-                )
-            failed = sum(result.status == "verification_failed" for result in results)
-            print(f"Verification complete: checked={len(results)} failed={failed}")
-            return 2 if failed else 0
-        if args.command == "rollback":
-            dry_run = args.dry_run or not args.confirm_owned_files_only
-            with Database(args.database) as database:
-                database.initialize()
-                rollback_results = Rollback(database).run(
-                    args.build_run_id, dry_run, args.confirm_owned_files_only
-                )
-            print(f"Rollback {'dry-run' if dry_run else 'complete'}: items={len(rollback_results)}")
-            return 0
-        with Database(args.database) as database:
-            database.initialize()
-            stats = database.stats()
-        print(f"Total indexed assets: {stats['total']}")
-        print(f"Currently available assets: {stats['available']}")
-        print(f"Missing assets: {stats['missing']}")
-        print(f"Scan errors: {stats['errors']}")
-        print(f"Total bytes: {stats['bytes']}")
-        print(f"Canonical file count: {stats['canonical_count']}")
-        print(f"Canonical bytes: {stats['canonical_bytes']}")
-        print(f"Canonical hashed count: {stats['canonical_hashed']}")
-        print(f"Candidate file count: {stats['candidate_count']}")
-        import_plan = stats["latest_import_plan"]
-        print(f"Latest import plan ID: {import_plan['id'] if import_plan else 'none'}")
-        print(f"Candidates already present: {import_plan['duplicate_count'] if import_plan else 0}")
-        print(f"Candidates planned as new: {import_plan['new_count'] if import_plan else 0}")
-        print(
-            f"Bytes avoided through existing duplicates: {import_plan['bytes_avoided'] if import_plan else 0}"
-        )
-        import_run = stats["latest_import_run"]
-        print(f"Latest import run ID: {import_run['id'] if import_run else 'none'}")
-        print("Totals by source:")
-        for row in stats["by_source"]:
-            print(f"  {row['source_name']}: {row['count']}")
-        print("Totals by extension:")
-        for row in stats["by_extension"]:
-            print(f"  {row['extension']}: {row['count']}")
-        latest = stats["latest_run"]
-        print(f"Latest scan-run status: {latest['status'] if latest else 'none'}")
-        print(f"Completed analyses: {stats['analyses_completed']}")
-        print(f"Failed analyses: {stats['analyses_failed']}")
-        print(f"Unsupported analyses: {stats['analyses_unsupported']}")
-        print(f"Assets with captured dates: {stats['with_captured_at']}")
-        print(f"Assets with GPS: {stats['with_gps']}")
-        print(f"Image count: {stats['images']}")
-        print(f"Video count: {stats['videos']}")
-        latest_analysis = stats["latest_analysis_run"]
-        print(
-            "Latest analysis-run status: "
-            f"{latest_analysis['status'] if latest_analysis else 'none'}"
-        )
-        print(f"Active relationships: {stats['relationships_active']}")
-        print(f"Apple Live Photos: {stats['apple_live_photos']}")
-        print(f"Exact Apple identifier pairs: {stats['apple_live_photos_exact']}")
-        print(f"One-sided Apple identifier fallback pairs: {stats['apple_live_photos_one_sided']}")
-        print(f"Google Motion Photos: {stats['google_motion_photos']}")
-        print(f"Samsung Motion Photos: {stats['samsung_motion_photos']}")
-        print(f"Fallback filename pairs: {stats['filename_pairs']}")
-        print(f"Orphan motion images: {stats['orphan_motion_images']}")
-        print(f"Orphan motion videos: {stats['orphan_motion_videos']}")
-        print(f"Ambiguous relationships: {stats['ambiguous_relationships']}")
-        print(f"Invalid relationships: {stats['invalid_relationships']}")
-        latest_relationship = stats["latest_relationship_run"]
-        print(
-            "Latest relationship-run status: "
-            f"{latest_relationship['status'] if latest_relationship else 'none'}"
-        )
-        latest_plan = stats["latest_plan"]
-        counts = stats["latest_plan_counts"]
-        print(f"Latest plan ID: {latest_plan['id'] if latest_plan else 'none'}")
-        print(f"Latest plan status: {latest_plan['status'] if latest_plan else 'none'}")
-        print(
-            "Latest plan candidate assets: "
-            f"{latest_plan['source_asset_count'] if latest_plan else 0}"
-        )
-        for label, key in (
-            ("keep actions", "keep_count"),
-            ("duplicate skips", "duplicate_skips"),
-            ("relationship members", "relationship_members"),
-            ("review items", "review_items"),
-            ("blocked items", "blocked_items"),
-            ("collisions", "collisions"),
-        ):
-            print(f"Latest plan {label}: {counts[key] or 0 if counts else 0}")
-        latest_build = stats["latest_build_run"]
-        print(f"Latest build run ID: {latest_build['id'] if latest_build else 'none'}")
-        print(f"Latest build run plan ID: {latest_build['plan_id'] if latest_build else 'none'}")
-        for label, key in (
-            ("mode", "mode"),
-            ("status", "status"),
-            ("completed items", "completed_items"),
-            ("failed items", "failed_items"),
-            ("verified items", "verified_items"),
-            ("verification failures", "verification_failed_items"),
-            ("bytes written", "bytes_written"),
-            ("rollback status", "rollback_status"),
-        ):
-            default = "none" if key in {"mode", "status", "rollback_status"} else 0
-            print(f"Latest build {label}: {latest_build[key] if latest_build else default}")
-        return 0
+        return COMMANDS[args.command](args)
     except (ConfigError, OSError, ValueError) as exc:
         logging.error("%s", exc)
         return 2
