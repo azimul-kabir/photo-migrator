@@ -17,6 +17,7 @@ from photo_migrator.atomic_io import atomic_write_csv, atomic_write_text
 from photo_migrator.config import Config, ConfigError, SourceConfig
 from photo_migrator.database import Database, utc_now
 from photo_migrator.filesystem_safety import contained, safe_destination, sha256_file
+from photo_migrator.media_types import media_type_for
 from photo_migrator.progress import (
     ProgressListener,
     ProgressTracker,
@@ -841,9 +842,7 @@ class IncrementalImporter:
                 "mtime_ns": stat_result.st_mtime_ns,
                 "device_id": stat_result.st_dev,
                 "inode": stat_result.st_ino,
-                "media_type": "video"
-                if path.suffix.lower() in {".mov", ".mp4", ".m4v"}
-                else "image",
+                "media_type": media_type_for(path.suffix),
                 "asset_role": role,
             }
         )

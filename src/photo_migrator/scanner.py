@@ -11,6 +11,7 @@ from pathlib import Path
 
 from photo_migrator.config import Config, SourceConfig
 from photo_migrator.database import Database
+from photo_migrator.media_types import media_type_for
 
 LOGGER = logging.getLogger(__name__)
 
@@ -28,10 +29,6 @@ def _contained(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
-
-
-def _media_type(extension: str) -> str:
-    return "video" if extension in {".mov", ".mp4", ".m4v"} else "image"
 
 
 class Scanner:
@@ -127,7 +124,7 @@ class Scanner:
                             "mtime_ns": metadata.st_mtime_ns,
                             "device_id": metadata.st_dev,
                             "inode": metadata.st_ino,
-                            "media_type": _media_type(extension),
+                            "media_type": media_type_for(extension),
                             "asset_role": role,
                         }
                     )
